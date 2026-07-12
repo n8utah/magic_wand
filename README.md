@@ -1,5 +1,9 @@
 # Magic Wand
+ESP32 Port and proof of concept for halloween prop activation.
+Currently ported to esp32 and a mcu6050 accelerometer.
+Working with the ASCII uart output, still need to validate the web bluetooth testing.
 
+ORIGINAL README:
 Magic Wand example for [TensorFlow Lite Micro](https://www.tensorflow.org/lite/microcontrollers) on the [Arduino Nano 33 BLE Sense](https://store.arduino.cc/usa/tiny-machine-learning-kit).
 
 ## Introduction
