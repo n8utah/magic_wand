@@ -5,6 +5,9 @@
 // Call once at startup while the user holds the board in waving position.
 bool ImuFrameCalibrate(int sample_count = 150);
 
+// Rebuild wand frame from a gravity vector in sensor coordinates (runtime auto-cal).
+bool ImuFrameRecalibrateFromSensorGravity(const float accel_sensor_g[3]);
+
 // Rotate accel (g) and gyro (deg/s) into the wand coordinate frame.
 void ImuFrameRemap(float accel_g[3], float gyro_dps[3]);
 

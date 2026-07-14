@@ -36,7 +36,9 @@ void PrintStrokeRasterAndClassify() {
 
   int axis_x = 0;
   int axis_y = 0;
-  if (StrokePipelineGetLastUsePca()) {
+  if (StrokePipelineGetLastUseWandAxes()) {
+    Serial.println(" (stroke mode: wand tip)");
+  } else if (StrokePipelineGetLastUsePca()) {
     Serial.println(" (stroke mode: PCA 3-axis)");
   } else if (StrokePipelineGetLastInPlanePca()) {
     Serial.print(" (stroke mode: in-plane PCA");
@@ -106,6 +108,14 @@ void setup() {
 
   StrokePipelineInit(ImuGyroscopeSampleRate());
 
+  float seed_accel_g[3] = {0.0f, 0.0f, 0.0f};
+  float seed_gyro_dps[3] = {0.0f, 0.0f, 0.0f};
+  if (ImuReadSample(seed_accel_g, seed_gyro_dps)) {
+    ImuFrameRemap(seed_accel_g, seed_gyro_dps);
+    StrokePipelineResetOrientationFromGravity(seed_accel_g);
+    StrokePipelineCaptureOrientationZero();
+  }
+
   if (!TfliteRunnerBegin()) {
     Serial.println("ERROR: TFLite model init failed.");
     while (true) {
@@ -124,6 +134,7 @@ void setup() {
   Serial.println();
   Serial.println("Web app: https://petewarden.github.io/magic_wand/website/index.html");
   Serial.println("Draw digits 0-9 in the air, pause to finish each gesture.");
+  Serial.println("Hold still ~0.3 s in hand to zero, ~1 s on table to full calibrate.");
   Serial.println();
 }
 
@@ -138,13 +149,38 @@ void loop() {
     return;
   }
 
+  const float raw_accel_g[3] = {accel_g[0], accel_g[1], accel_g[2]};
   ImuFrameRemap(accel_g, gyro_dps);
 
   bool done_just_triggered = false;
   StrokePipelineAddSample(accel_g, gyro_dps, &done_just_triggered);
 
+  float raw_accel_avg[3];
+  float gyro_avg[3];
+  const OrientationAutoZeroKind auto_zero =
+      StrokePipelineUpdateAutoOrientation(raw_accel_g, gyro_dps, raw_accel_avg, gyro_avg);
+  if (auto_zero != kOrientationAutoZeroNone) {
+    if ((auto_zero == kOrientationAutoZeroFullSettle) &&
+        kOrientationAutoZeroRecalibrateFrame) {
+      ImuFrameRecalibrateFromSensorGravity(raw_accel_avg);
+    }
+    float wand_accel_g[3] = {raw_accel_avg[0], raw_accel_avg[1], raw_accel_avg[2]};
+    float dummy_gyro[3] = {0.0f, 0.0f, 0.0f};
+    ImuFrameRemap(wand_accel_g, dummy_gyro);
+    StrokePipelineApplyAutoOrientationCalibration(wand_accel_g, gyro_avg);
+    if (auto_zero == kOrientationAutoZeroFullSettle) {
+      Serial.println("Orientation auto-calibrated (settled).");
+    } else {
+      Serial.println("Orientation zeroed (ready).");
+    }
+  }
+
   if (BleStrokeServiceIsConnected()) {
     BleStrokeServiceUpdate(StrokePipelineGetBuffer(), kStrokeStructByteCount);
+    float orientation_deg[3];
+    StrokePipelineGetCurrentOrientation(orientation_deg);
+    BleStrokeServiceUpdateOrientation(orientation_deg[0], orientation_deg[1],
+                                      orientation_deg[2]);
   }
 
   if (done_just_triggered) {

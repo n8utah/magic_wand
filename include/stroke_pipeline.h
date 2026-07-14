@@ -39,8 +39,33 @@ void StrokePipelineGetLastMotionMode(int8_t* motion_mode);
 void StrokePipelineGetLastAxes(int* axis_x, int* axis_y);
 bool StrokePipelineGetLastTiltCompensated();
 bool StrokePipelineGetLastUsePca();
+bool StrokePipelineGetLastUseWandAxes();
 bool StrokePipelineGetLastInPlanePca();
 bool StrokePipelineGetLastUseGravityPlane();
 bool StrokePipelineGetLastGravityTracked();
+
+// Latest integrated wand orientation (degrees, wand frame X/Y/Z).
+void StrokePipelineGetCurrentOrientation(float orientation_deg[3]);
+
+// Seed integrated orientation from gravity (call once after wand-frame calibration).
+void StrokePipelineResetOrientationFromGravity(const float accel_g[3]);
+
+// Make the current pose read as 0° on all axes (after gravity seed or motion).
+void StrokePipelineCaptureOrientationZero();
+
+// Gravity seed + zero capture + drift/velocity reset (runtime auto-cal).
+void StrokePipelineApplyAutoOrientationCalibration(const float wand_accel_g[3],
+                                                 const float gyro_avg_dps[3]);
+
+enum OrientationAutoZeroKind : uint8_t {
+  kOrientationAutoZeroNone = 0,
+  kOrientationAutoZeroQuickHold = 1,
+  kOrientationAutoZeroFullSettle = 2,
+};
+
+// When still and not drawing, returns kind + averaged sensor-frame samples.
+OrientationAutoZeroKind StrokePipelineUpdateAutoOrientation(
+    const float raw_accel_sensor_g[3], const float gyro_wand_dps[3],
+    float raw_accel_avg_out[3], float gyro_avg_out[3]);
 
 #endif  // MAGIC_WAND_STROKE_PIPELINE_H_

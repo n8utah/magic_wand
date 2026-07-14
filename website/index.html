@@ -25,7 +25,7 @@
   }
 
   .container {
-    width:860px;height:384px;margin-top:30px;margin-bottom:7.5px;  margin: 0 auto; position: relative;
+    width:1240px;height:384px;margin-top:30px;margin-bottom:7.5px;  margin: 0 auto; position: relative;
   }
 
   .widget {
@@ -44,7 +44,7 @@
     background-size: 80px;
     background-position: 98% 50%;
     background-repeat: no-repeat;
-    width: 885px;  height: 42px;
+    width: 1240px;  height: 42px;
     color: white;
   }
 
@@ -100,6 +100,7 @@
         <li>Upload the <a href="https://create.arduino.cc/editor/petewarden/669b0490-720a-4d5e-a1c0-2055823f4c08/preview">Magic Wand Capture sketch</a> to an Arduino Nano BLE Sense board</li>
         <li>Connect to the board using the Bluetooth button below.</li>
         <li>Wave the wand to make gestures. They'll be recorded and displayed on the right.</li>
+        <li>The 3D view shows live integrated orientation (X/Y/Z degrees, wand frame).</li>
         <li>Review the gestures, add labels by clicking on the '?', and remove mistakes.</li>
         <li>Download the gestures as a JSON data file, ready for model training.</li>
       </ul>
@@ -112,6 +113,12 @@
     </div>
 
     <div class="widget">
+      <div id="orientation_label" class="label">Orientation — connect to view</div>
+      <div id="gravity_hint" class="label" style="font-size:12px;color:#44ff44;">Green arrow = gravity (down)</div>
+      <div id="orientation_3d" class="square"></div>
+    </div>
+
+    <div class="widget">
       <div id="stroke_label" class="label"></div>
       <canvas id="stroke" width="640px" height="640px" class="square"></canvas>
     </div>
@@ -120,6 +127,7 @@
     </div>
   </div>
 </body>
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
 <script type="text/javascript">
 // Thanks to Dom Pajak for his original Arduino BLE Sense connection demo:
 // https://arduino.github.io/ArduinoAI/BLESense-test-dashboard/
@@ -165,26 +173,44 @@ async function connect() {
   const service = await server.getPrimaryService(SERVICE_UUID);
 
   // Set up the characteristics
+  var orientationAvailable = false;
   for (const sensor of sensors) {
     msg('Characteristic '+sensor+"...");
-    BLEsense[sensor].characteristic = await service.getCharacteristic(BLEsense[sensor].uuid);
-    // Set up notification
-    if (BLEsense[sensor].properties.includes("BLENotify")){
-      BLEsense[sensor].characteristic.addEventListener('characteristicvaluechanged',function(event){handleIncoming(BLEsense[sensor],event.target.value);});
+    try {
+      BLEsense[sensor].characteristic = await service.getCharacteristic(BLEsense[sensor].uuid);
+    } catch (err) {
+      console.warn('Missing characteristic:', sensor, err);
+      if (sensor === 'orientation') {
+        BLEsense[sensor].available = false;
+        continue;
+      }
+      throw err;
+    }
+    BLEsense[sensor].available = true;
+    if (sensor === 'orientation') {
+      orientationAvailable = true;
+    }
+    if (BLEsense[sensor].properties.includes("BLENotify")) {
+      BLEsense[sensor].characteristic.addEventListener(
+          'characteristicvaluechanged',
+          function(event) { handleIncoming(BLEsense[sensor], event.target.value); });
       await BLEsense[sensor].characteristic.startNotifications();
     }
-    // Set up polling for read
-    if (BLEsense[sensor].properties.includes("BLERead")){
+    if (BLEsense[sensor].properties.includes("BLERead")) {
       BLEsense[sensor].polling = setInterval(function() {
-        BLEsense[sensor].characteristic.readValue().then(function(data){handleIncoming(BLEsense[sensor],data);})}
-        , 200);
-      }
-
-      BLEsense[sensor].rendered = false;
+        BLEsense[sensor].characteristic.readValue().then(
+            function(data) { handleIncoming(BLEsense[sensor], data); });
+      }, 200);
     }
-    bigButton.style.backgroundColor = 'green';
-    msg('Connected.');
+    BLEsense[sensor].rendered = false;
   }
+  bigButton.style.backgroundColor = 'green';
+  if (orientationAvailable) {
+    msg('Connected — stroke + live orientation.');
+  } else {
+    msg('Connected — upload latest ESP32 firmware for 3D orientation.');
+  }
+}
   
   function getStrokePoints(dataview, byteOffset, littleEndian) {
     var result = [];
@@ -231,6 +257,10 @@ async function connect() {
       i++;
     });
     sensor.rendered = false; // flag - vizualization needs to be updated
+    if (sensor === BLEsense.orientation && sensor.data.x.length > 0) {
+      collectOrientationZero(
+          sensor.data.x.latest(), sensor.data.y.latest(), sensor.data.z.latest());
+    }
     if (typeof sensor.onUpdate != 'undefined') {
       sensor.onUpdate();
     }
@@ -239,6 +269,7 @@ async function connect() {
   function onDisconnected(event) {
     let device = event.target;
     bigButton.style.backgroundColor="red";
+    resetOrientationZero();
     // clear read polling
     for (const sensor of sensors) {
       if(typeof BLEsense[sensor].polling !== 'undefined'){
@@ -421,6 +452,17 @@ function updateStrokeGraph() {
 
 var BLEsense =
 {
+  orientation:
+  {
+    uuid: '4798e0f2-300b-4d68-af64-8a8f5258404e',
+    properties: ['BLENotify'],
+    structure: ['Float32', 'Float32', 'Float32'],
+    data: {
+      'x': [], 'y': [], 'z': [],
+    },
+    available: false,
+    onUpdate: function() { BLEsense.orientation.rendered = false; },
+  },
   stroke:
   {
     uuid: '4798e0f2-300a-4d68-af64-8a8f5258404e',
@@ -440,6 +482,191 @@ const sensors = Object.keys(BLEsense);
 const SERVICE_UUID = '4798e0f2-0000-4d68-af64-8a8f5258404e';
 var bytesReceived = 0;
 var bytesPrevious = 0;
+
+// --- Live 3D orientation view (Three.js) ---
+var orientationScene = null;
+var orientationCamera = null;
+var orientationRenderer = null;
+var wandGroup = null;
+var orientationZero = { x: 0, y: 0, z: 0 };
+var orientationZeroSet = false;
+var orientationZeroSamples = [];
+var orientationResyncSamples = 0;
+
+function normalizeAngleDeg(deg) {
+  let angle = deg;
+  while (angle > 180) {
+    angle -= 360;
+  }
+  while (angle < -180) {
+    angle += 360;
+  }
+  return angle;
+}
+
+function relativeAngleDeg(current, zero) {
+  return normalizeAngleDeg(current - zero);
+}
+
+function collectOrientationZero(ox, oy, oz) {
+  if (orientationZeroSet || !BLEsense.orientation.available) {
+    return;
+  }
+  orientationZeroSamples.push({ x: ox, y: oy, z: oz });
+  if (orientationZeroSamples.length < 20) {
+    return;
+  }
+  let sx = 0;
+  let sy = 0;
+  let sz = 0;
+  for (const sample of orientationZeroSamples) {
+    sx += sample.x;
+    sy += sample.y;
+    sz += sample.z;
+  }
+  const count = orientationZeroSamples.length;
+  orientationZero.x = sx / count;
+  orientationZero.y = sy / count;
+  orientationZero.z = sz / count;
+  orientationZeroSet = true;
+}
+
+function resetOrientationZero() {
+  orientationZeroSet = false;
+  orientationZeroSamples = [];
+  orientationResyncSamples = 0;
+  orientationZero.x = 0;
+  orientationZero.y = 0;
+  orientationZero.z = 0;
+}
+
+// Firmware auto-zero sends ~0° when held still; re-sync web viewer without reconnecting.
+function maybeResyncOrientationZero(ox, oy, oz) {
+  if (!orientationZeroSet || !BLEsense.orientation.available) {
+    return;
+  }
+  if (Math.abs(ox) > 3 || Math.abs(oy) > 3 || Math.abs(oz) > 3) {
+    orientationResyncSamples = 0;
+    return;
+  }
+  orientationResyncSamples += 1;
+  if (orientationResyncSamples >= 30) {
+    orientationZero.x = ox;
+    orientationZero.y = oy;
+    orientationZero.z = oz;
+    orientationResyncSamples = 0;
+  }
+}
+
+function initOrientation3D() {
+  const container = document.getElementById('orientation_3d');
+  if (!container || typeof THREE === 'undefined') {
+    return;
+  }
+
+  const width = 320;
+  const height = 320;
+
+  orientationScene = new THREE.Scene();
+  orientationScene.background = new THREE.Color(0x111111);
+
+  orientationCamera = new THREE.PerspectiveCamera(45, width / height, 0.1, 100);
+  orientationCamera.position.set(-2.2, 1.4, 2.2);
+  orientationCamera.lookAt(0, 0, 0);
+
+  orientationRenderer = new THREE.WebGLRenderer({ antialias: true });
+  orientationRenderer.setSize(width, height);
+  orientationRenderer.setPixelRatio(window.devicePixelRatio || 1);
+  container.innerHTML = '';
+  container.appendChild(orientationRenderer.domElement);
+
+  orientationScene.add(new THREE.AmbientLight(0xffffff, 0.55));
+  const keyLight = new THREE.DirectionalLight(0xffffff, 0.85);
+  keyLight.position.set(2, 3, 4);
+  orientationScene.add(keyLight);
+
+  const grid = new THREE.GridHelper(3, 12, 0x333333, 0x222222);
+  orientationScene.add(grid);
+
+  const axes = new THREE.AxesHelper(1.2);
+  orientationScene.add(axes);
+
+  // World gravity reference (down = -Y in scene).
+  const gravityDir = new THREE.Vector3(0, -1, 0);
+  const gravityArrow = new THREE.ArrowHelper(
+      gravityDir, new THREE.Vector3(0, 0, 0), 1.1, 0x44ff44, 0.12, 0.08);
+  orientationScene.add(gravityArrow);
+
+  wandGroup = new THREE.Group();
+
+  const shaftGeom = new THREE.BoxGeometry(1.6, 0.1, 0.1);
+  const shaftMat = new THREE.MeshPhongMaterial({ color: 0x00ffff });
+  const shaft = new THREE.Mesh(shaftGeom, shaftMat);
+  shaft.position.x = 0.8;
+  wandGroup.add(shaft);
+
+  const tipGeom = new THREE.SphereGeometry(0.09, 16, 16);
+  const tipMat = new THREE.MeshPhongMaterial({ color: 0xff5555 });
+  const tip = new THREE.Mesh(tipGeom, tipMat);
+  tip.position.x = 1.65;
+  wandGroup.add(tip);
+
+  const tailGeom = new THREE.BoxGeometry(0.14, 0.14, 0.14);
+  const tailMat = new THREE.MeshPhongMaterial({ color: 0x888888 });
+  const tail = new THREE.Mesh(tailGeom, tailMat);
+  tail.position.x = 0.05;
+  wandGroup.add(tail);
+
+  orientationScene.add(wandGroup);
+}
+
+function renderOrientation3D() {
+  if (!orientationRenderer || !wandGroup) {
+    return;
+  }
+  const sensor = BLEsense.orientation;
+  if (!sensor.available || sensor.data.x.length === 0) {
+    orientationRenderer.render(orientationScene, orientationCamera);
+    return;
+  }
+
+  const ox = sensor.data.x.latest();
+  const oy = sensor.data.y.latest();
+  const oz = sensor.data.z.latest();
+
+  collectOrientationZero(ox, oy, oz);
+  maybeResyncOrientationZero(ox, oy, oz);
+
+  if (!orientationZeroSet) {
+    const label = document.getElementById('orientation_label');
+    if (label) {
+      label.innerText = 'Hold still — zeroing… (' + orientationZeroSamples.length + '/20)';
+    }
+    orientationRenderer.render(orientationScene, orientationCamera);
+    return;
+  }
+
+  const rx = relativeAngleDeg(ox, orientationZero.x);
+  const ry = relativeAngleDeg(oy, orientationZero.y);
+  const rz = relativeAngleDeg(oz, orientationZero.z);
+
+  // Shaft = +X. Three.js: rot Z moves tip in XY (up/down), rot Y moves tip in XZ (left/right).
+  // Firmware: ΔY ↔ left/right, ΔZ ↔ up/down. Tune signs with ORIENTATION_VIZ_SIGN if needed.
+  const ORIENTATION_VIZ_SIGN = { x: 1, y: 1, z: 1 };
+  wandGroup.rotation.set(
+      THREE.MathUtils.degToRad(ORIENTATION_VIZ_SIGN.x * rx),
+      THREE.MathUtils.degToRad(ORIENTATION_VIZ_SIGN.y * ry),
+      THREE.MathUtils.degToRad(ORIENTATION_VIZ_SIGN.z * rz),
+      'XYZ');
+
+  const label = document.getElementById('orientation_label');
+  if (label) {
+    label.innerText =
+        'ΔX ' + rx.toFixed(1) + '°  ΔY ' + ry.toFixed(1) + '°  ΔZ ' + rz.toFixed(1) + '°';
+  }
+
+  orientationRenderer.render(orientationScene, orientationCamera);
+}
     
 // return last item of array
 Array.prototype.latest = function(){return this[this.length - 1];};
@@ -461,6 +688,7 @@ Array.prototype.latest = function(){return this[this.length - 1];};
         BLEsense[sensor].rendered = true;
       }
     }
+    renderOrientation3D();
     if (skip_frame == false){ // TODO update with fuction to iterate object with viz function as a property      
       skip_frame = true; // render alternate frames = 30fps
     } else {skip_frame=false;}
@@ -468,6 +696,7 @@ Array.prototype.latest = function(){return this[this.length - 1];};
   }
   
   initStrokeGraph();
+  initOrientation3D();
     
   requestAnimationFrame(draw);
   </script>

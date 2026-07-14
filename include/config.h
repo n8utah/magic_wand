@@ -11,11 +11,50 @@ constexpr uint8_t kMpu6050Address = 0x68;
 // Target sample rate used by orientation integration (must match actual rate).
 constexpr float kImuSampleRateHz = 100.0f;
 
+// Complementary filter: blend integrated gyro with accelerometer tilt (reduces drift).
+constexpr bool kOrientationAccelFusion = true;
+// Accel tilt correction cross-couples Y/Z during fast strokes; keep off while drawing.
+constexpr bool kOrientationAccelFusionDuringStroke = false;
+// Gyro weight per sample at 100 Hz (0.992 ≈ corrects over ~1 s when still).
+constexpr float kOrientationFusionAlpha = 0.992f;
+constexpr float kOrientationFusionAlphaMoving = 0.998f;
+
+// User-facing orientation (matches 3D debug view): X=shaft roll, Y=left/right, Z=up/down.
+constexpr float kOrientationOutputSignX = 1.0f;
+constexpr float kOrientationOutputSignY = -1.0f;
+constexpr float kOrientationOutputSignZ = 1.0f;
+
+// When still (not drawing), re-calibrate wand frame + zero orientation to current pose.
+constexpr bool kOrientationAutoZero = true;
+
+// Quick path: hand-held ready pose (~100 Hz). 30 ≈ 0.3 s.
+constexpr int kOrientationAutoZeroQuickSamples = 30;
+constexpr float kOrientationAutoZeroQuickGyroThresholdDps = 12.0f;
+constexpr int kOrientationAutoZeroQuickCooldownSamples = 50;
+// Leaky decay when hand jitter breaks stillness (avoids hard reset to 0).
+constexpr int kOrientationAutoZeroQuickDecaySamples = 4;
+
+// Full path: set-down / pick-up with frame rebuild. 100 ≈ 1.0 s.
+constexpr int kOrientationAutoZeroFullSamples = 100;
+constexpr float kOrientationAutoZeroFullGyroThresholdDps = 4.0f;
+constexpr int kOrientationAutoZeroFullCooldownSamples = 150;
+// Rebuild sensor→wand frame from averaged gravity (full settle only).
+constexpr bool kOrientationAutoZeroRecalibrateFrame = true;
+
 // Set true if gestures render vertically mirrored (e.g. ^ appears as v).
 constexpr bool kFlipWandStrokeY = true;
 
-// Swap stroke X/Y output if shapes appear rotated 90 degrees.
-constexpr bool kSwapWandStrokeXY = true;
+// Swap stroke X/Y output if shapes appear rotated 90 degrees (legacy Nano).
+constexpr bool kSwapWandStrokeXY = false;
+
+// Flat strokes: always project wand tip onto gravity-perpendicular canvas.
+constexpr bool kStrokeUseWandAxisProjection = true;
+// Tip distance along +X shaft (matches 3D viewer red sphere at x=1.65).
+constexpr float kWandTipLength = 1.65f;
+// Project stroke from tip pose at gesture start.
+constexpr bool kStrokeWandAxisUseStartOrigin = true;
+// When false, preserve both canvas axes (no line collapse).
+constexpr bool kStrokeWandAxisCollapseLines = false;
 
 // Project each stroke with 3D PCA when flat; gravity plane when tipped.
 constexpr bool kStrokeUsePcaProjection = true;

@@ -58,7 +58,34 @@ int PickShaftAxis(const float gravity_sensor[3]) {
   return shaft_axis;
 }
 
+bool BuildWandFrameFromGravity(const float gravity_sensor[3]) {
+  float gravity[3] = {gravity_sensor[0], gravity_sensor[1], gravity_sensor[2]};
+  Normalize(gravity);
+
+  const int shaft_axis = PickShaftAxis(gravity);
+  shaft_axis_index = shaft_axis;
+  basis_wand_x[0] = basis_wand_x[1] = basis_wand_x[2] = 0.0f;
+  basis_wand_x[shaft_axis] = 1.0f;
+
+  Cross(basis_wand_x, gravity, basis_wand_z);
+  if (Length(basis_wand_z) < 0.0001f) {
+    return false;
+  }
+  Normalize(basis_wand_z);
+
+  Cross(basis_wand_z, basis_wand_x, basis_wand_y);
+  Normalize(basis_wand_y);
+
+  TransformToWandFrame(gravity, wand_gravity);
+  calibrated = true;
+  return true;
+}
+
 }  // namespace
+
+bool ImuFrameRecalibrateFromSensorGravity(const float accel_sensor_g[3]) {
+  return BuildWandFrameFromGravity(accel_sensor_g);
+}
 
 bool ImuFrameCalibrate(int sample_count) {
   float gravity_sum[3] = {0.0f, 0.0f, 0.0f};
@@ -86,25 +113,7 @@ bool ImuFrameCalibrate(int sample_count) {
       gravity_sum[1] / collected,
       gravity_sum[2] / collected,
   };
-  Normalize(gravity_sensor);
-
-  const int shaft_axis = PickShaftAxis(gravity_sensor);
-  shaft_axis_index = shaft_axis;
-  basis_wand_x[0] = basis_wand_x[1] = basis_wand_x[2] = 0.0f;
-  basis_wand_x[shaft_axis] = 1.0f;
-
-  Cross(basis_wand_x, gravity_sensor, basis_wand_z);
-  if (Length(basis_wand_z) < 0.0001f) {
-    return false;
-  }
-  Normalize(basis_wand_z);
-
-  Cross(basis_wand_z, basis_wand_x, basis_wand_y);
-  Normalize(basis_wand_y);
-
-  TransformToWandFrame(gravity_sensor, wand_gravity);
-  calibrated = true;
-  return true;
+  return BuildWandFrameFromGravity(gravity_sensor);
 }
 
 void ImuFrameRemap(float accel_g[3], float gyro_dps[3]) {

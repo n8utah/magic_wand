@@ -33,16 +33,30 @@ int last_stroke_axis_y = 1;
 bool last_stroke_tilt_compensated = false;
 bool last_stroke_use_gravity_plane = false;
 bool last_stroke_use_pca = false;
+bool last_stroke_use_wand_axes = false;
 bool last_stroke_in_plane_pca = false;
 bool last_stroke_gravity_tracked = false;
 float stroke_gravity_snapshot[3] = {0.0f, 1.0f, 0.0f};
 bool stroke_gravity_snapshot_valid = false;
+float orientation_zero[3] = {0.0f, 0.0f, 0.0f};
+int auto_zero_cooldown = 0;
+int auto_zero_quick_count = 0;
+int auto_zero_full_count = 0;
+float auto_zero_full_accel_mag_min = 999.0f;
+float auto_zero_full_accel_mag_max = 0.0f;
+float auto_zero_quick_accel_sum[3] = {0.0f, 0.0f, 0.0f};
+float auto_zero_quick_gyro_sum[3] = {0.0f, 0.0f, 0.0f};
+float auto_zero_full_accel_sum[3] = {0.0f, 0.0f, 0.0f};
+float auto_zero_full_gyro_sum[3] = {0.0f, 0.0f, 0.0f};
 uint8_t stroke_struct_buffer[kStrokeStructByteCount] = {};
 int32_t* stroke_state = reinterpret_cast<int32_t*>(stroke_struct_buffer);
 int32_t* stroke_transmit_length =
     reinterpret_cast<int32_t*>(stroke_struct_buffer + sizeof(int32_t));
 int8_t* stroke_points =
     reinterpret_cast<int8_t*>(stroke_struct_buffer + (sizeof(int32_t) * 2));
+
+void ApplyOrientationConvention(const float in[3], float out[3]);
+void GetOrientationAt(int start_index, int sample_index, float out[3]);
 
 float VectorMagnitude(const float* vec) {
   const float x = vec[0];
@@ -132,11 +146,6 @@ void UpdateVelocity(int new_samples, float* gravity) {
 }
 
 void EstimateGyroscopeDrift(float* drift) {
-  const bool is_moving = VectorMagnitude(current_velocity) > 0.1f;
-  if (is_moving) {
-    return;
-  }
-
   int samples_to_average = 20;
   if (samples_to_average >= gyroscope_data_index) {
     samples_to_average = gyroscope_data_index;
@@ -160,28 +169,95 @@ void EstimateGyroscopeDrift(float* drift) {
     y_total += entry[1];
     z_total += entry[2];
   }
-  drift[0] = x_total / samples_to_average;
-  drift[1] = y_total / samples_to_average;
-  drift[2] = z_total / samples_to_average;
+  const float inv = 1.0f / static_cast<float>(samples_to_average);
+  const float avg_x = x_total * inv;
+  const float avg_y = y_total * inv;
+  const float avg_z = z_total * inv;
+
+  const float motion = VectorMagnitude(current_velocity);
+  const bool is_moving = motion > 0.1f;
+  const float gyro_mag_sq = (avg_x * avg_x) + (avg_y * avg_y) + (avg_z * avg_z);
+  const bool is_rotating_fast = gyro_mag_sq > 25.0f;
+
+  if (is_moving || is_rotating_fast) {
+    return;
+  }
+
+  constexpr float kDriftBlend = 0.05f;
+  drift[0] = ((1.0f - kDriftBlend) * drift[0]) + (kDriftBlend * avg_x);
+  drift[1] = ((1.0f - kDriftBlend) * drift[1]) + (kDriftBlend * avg_y);
+  drift[2] = ((1.0f - kDriftBlend) * drift[2]) + (kDriftBlend * avg_z);
+}
+
+constexpr float kRadToDeg = 57.2957795f;
+constexpr float kDegToRad = 0.0174532925f;
+
+float NormalizeAngleDiff(float target_deg, float current_deg) {
+  float diff = target_deg - current_deg;
+  while (diff > 180.0f) {
+    diff -= 360.0f;
+  }
+  while (diff < -180.0f) {
+    diff += 360.0f;
+  }
+  return diff;
+}
+
+void TiltFromGravity(const float accel_g[3], float tilt_deg[3]) {
+  float ax = accel_g[0];
+  float ay = accel_g[1];
+  float az = accel_g[2];
+  const float norm = sqrtf((ax * ax) + (ay * ay) + (az * az));
+  if (norm < 0.5f) {
+    return;
+  }
+  ax /= norm;
+  ay /= norm;
+  az /= norm;
+
+  const float yz_len = sqrtf((ay * ay) + (az * az));
+  const float safe_yz = (yz_len < 0.001f) ? 0.001f : yz_len;
+
+  // Match integrated gx/gy/gz channels: roll about X, pitch about Y, yaw about Z.
+  tilt_deg[0] = atan2f(az, ay) * kRadToDeg;
+  tilt_deg[1] = atan2f(-ax, safe_yz) * kRadToDeg;
+  tilt_deg[2] = atan2f(ax, ay) * kRadToDeg;
+}
+
+void FuseOrientationWithAccel(int orientation_index, float alpha) {
+  const float* accel = &acceleration_data[orientation_index];
+  float tilt_deg[3] = {0.0f, 0.0f, 0.0f};
+  TiltFromGravity(accel, tilt_deg);
+
+  float* orientation = &orientation_data[orientation_index];
+  orientation[0] +=
+      (1.0f - alpha) * NormalizeAngleDiff(tilt_deg[0], orientation[0]);
+  orientation[1] +=
+      (1.0f - alpha) * NormalizeAngleDiff(tilt_deg[1], orientation[1]);
+  orientation[2] +=
+      (1.0f - alpha) * NormalizeAngleDiff(tilt_deg[2], orientation[2]);
 }
 
 void UpdateOrientation(int new_samples, float* drift) {
-  const float drift_x = drift[0];
-  const float drift_y = drift[1];
-  const float drift_z = drift[2];
 
   const int start_index =
       ((gyroscope_data_index + (kGyroscopeDataLength - (3 * new_samples))) %
        kGyroscopeDataLength);
+  const int accel_start_index =
+      ((acceleration_data_index +
+        (kAccelerationDataLength - (3 * new_samples))) %
+       kAccelerationDataLength);
 
   const float recip_sample_rate = 1.0f / gyroscope_sample_rate;
 
   for (int i = 0; i < new_samples; ++i) {
     const int index = ((start_index + (i * 3)) % kGyroscopeDataLength);
+    const int accel_index =
+        ((accel_start_index + (i * 3)) % kAccelerationDataLength);
     const float* entry = &gyroscope_data[index];
-    const float dx_minus_drift = entry[0] - drift_x;
-    const float dy_minus_drift = entry[1] - drift_y;
-    const float dz_minus_drift = entry[2] - drift_z;
+    const float dx_minus_drift = entry[0] - drift[0];
+    const float dy_minus_drift = entry[1] - drift[1];
+    const float dz_minus_drift = entry[2] - drift[2];
 
     const float dx_normalized = dx_minus_drift * recip_sample_rate;
     const float dy_normalized = dy_minus_drift * recip_sample_rate;
@@ -194,6 +270,18 @@ void UpdateOrientation(int new_samples, float* drift) {
     current_orientation[0] = previous_orientation[0] + dx_normalized;
     current_orientation[1] = previous_orientation[1] + dy_normalized;
     current_orientation[2] = previous_orientation[2] + dz_normalized;
+
+    if (kOrientationAccelFusion &&
+        ((*stroke_state != kStrokeDrawing) || kOrientationAccelFusionDuringStroke)) {
+      const float motion = VectorMagnitude(current_velocity);
+      const float gyro_mag_sq = (dx_minus_drift * dx_minus_drift) +
+                                (dy_minus_drift * dy_minus_drift) +
+                                (dz_minus_drift * dz_minus_drift);
+      const bool moving = (motion > 0.15f) || (gyro_mag_sq > 400.0f);
+      const float alpha =
+          moving ? kOrientationFusionAlphaMoving : kOrientationFusionAlpha;
+      FuseOrientationWithAccel(accel_index, alpha);
+    }
   }
 }
 
@@ -246,11 +334,11 @@ void SelectDominantStrokeAxes(int start_index, int stroke_length, float ox, floa
   constexpr float range = 90.0f;
 
   for (int j = 0; j < stroke_length; ++j) {
-    const int index = ((start_index + (j * 3)) % kGyroscopeDataLength);
-    const float* entry = &orientation_data[index];
-    const float nx = (entry[0] - ox) / range;
-    const float ny = (entry[1] - oy) / range;
-    const float nz = (entry[2] - oz) / range;
+    float orientation[3];
+    GetOrientationAt(start_index, j, orientation);
+    const float nx = (orientation[0] - ox) / range;
+    const float ny = (orientation[1] - oy) / range;
+    const float nz = (orientation[2] - oz) / range;
     variance[0] += nx * nx;
     variance[1] += ny * ny;
     variance[2] += nz * nz;
@@ -297,6 +385,41 @@ void Cross3(const float a[3], const float b[3], float out[3]) {
   out[2] = (a[0] * b[1]) - (a[1] * b[0]);
 }
 
+float Dot3(const float a[3], const float b[3]) {
+  return (a[0] * b[0]) + (a[1] * b[1]) + (a[2] * b[2]);
+}
+
+// Match Three.js wandGroup.rotation.set(rx, ry, rz, 'XYZ').
+void RotateVectorEulerXYZ(const float v[3], float rx_deg, float ry_deg, float rz_deg,
+                          float out[3]) {
+  const float rx = rx_deg * kDegToRad;
+  const float ry = ry_deg * kDegToRad;
+  const float rz = rz_deg * kDegToRad;
+
+  const float cx = cosf(rx);
+  const float sx = sinf(rx);
+  const float cy = cosf(ry);
+  const float sy = sinf(ry);
+  const float cz = cosf(rz);
+  const float sz = sinf(rz);
+
+  const float y1 = (v[1] * cx) - (v[2] * sx);
+  const float z1 = (v[1] * sx) + (v[2] * cx);
+
+  const float x2 = (v[0] * cy) + (z1 * sy);
+  const float y2 = y1;
+  const float z2 = (-v[0] * sy) + (z1 * cy);
+
+  out[0] = (x2 * cz) - (y2 * sz);
+  out[1] = (x2 * sz) + (y2 * cz);
+  out[2] = z2;
+}
+
+void ComputeWandTipPosition(float rx_deg, float ry_deg, float rz_deg, float tip[3]) {
+  const float tip_local[3] = {kWandTipLength, 0.0f, 0.0f};
+  RotateVectorEulerXYZ(tip_local, rx_deg, ry_deg, rz_deg, tip);
+}
+
 void EstimateGravityOverStroke(int start_index, int stroke_length, float gravity[3]) {
   float x_total = 0.0f;
   float y_total = 0.0f;
@@ -314,8 +437,8 @@ void EstimateGravityOverStroke(int start_index, int stroke_length, float gravity
 }
 
 void ApplyStrokeOutputMapping(float* x_axis, float* y_axis) {
-  *x_axis *= kStrokeVerticalSign;
-  *y_axis *= kStrokeHorizontalSign;
+  *x_axis *= kStrokeHorizontalSign;
+  *y_axis *= kStrokeVerticalSign;
   if (kSwapWandStrokeXY) {
     const float tmp = *x_axis;
     *x_axis = *y_axis;
@@ -477,31 +600,40 @@ bool IsStrokeTipped(const float gravity[3]) {
   return kStrokeTiltCompensate && (fabsf(gravity[0]) >= kStrokeTippedThresholdG);
 }
 
+void ApplyOrientationConvention(const float in[3], float out[3]) {
+  out[0] = in[0] * kOrientationOutputSignX;
+  out[1] = in[1] * kOrientationOutputSignY;
+  out[2] = in[2] * kOrientationOutputSignZ;
+}
+
+void GetIntegratedOrientationAt(int start_index, int sample_index, float out[3]) {
+  const int orientation_index =
+      ((start_index + (sample_index * 3)) % kGyroscopeDataLength);
+  ApplyOrientationConvention(&orientation_data[orientation_index], out);
+}
+
+void GetOrientationAt(int start_index, int sample_index, float out[3]) {
+  GetIntegratedOrientationAt(start_index, sample_index, out);
+  out[0] -= orientation_zero[0];
+  out[1] -= orientation_zero[1];
+  out[2] -= orientation_zero[2];
+}
+
 void ComputeStrokeOrientationMean(int start_index, int stroke_length, float mean[3]) {
   mean[0] = 0.0f;
   mean[1] = 0.0f;
   mean[2] = 0.0f;
   for (int j = 0; j < stroke_length; ++j) {
-    const int orientation_index =
-        ((start_index + (j * 3)) % kGyroscopeDataLength);
-    const float* orientation_entry = &orientation_data[orientation_index];
-    mean[0] += orientation_entry[0];
-    mean[1] += orientation_entry[1];
-    mean[2] += orientation_entry[2];
+    float orientation[3];
+    GetOrientationAt(start_index, j, orientation);
+    mean[0] += orientation[0];
+    mean[1] += orientation[1];
+    mean[2] += orientation[2];
   }
   const float inv_count = 1.0f / static_cast<float>(stroke_length);
   mean[0] *= inv_count;
   mean[1] *= inv_count;
   mean[2] *= inv_count;
-}
-
-void GetOrientationAt(int start_index, int sample_index, float out[3]) {
-  const int orientation_index =
-      ((start_index + (sample_index * 3)) % kGyroscopeDataLength);
-  const float* orientation_entry = &orientation_data[orientation_index];
-  out[0] = orientation_entry[0];
-  out[1] = orientation_entry[1];
-  out[2] = orientation_entry[2];
 }
 
 void NormalizeOrientationSample(const float orientation[3], const float mean[3],
@@ -621,7 +753,8 @@ void Compute2dPcaBasis(const float pu[kStrokeMaxLength], const float pv[kStrokeM
 void FinalizeProjectedStroke(const float proj_x[kStrokeTransmitMaxLength],
                              const float proj_y[kStrokeTransmitMaxLength],
                              int transmit_length, int8_t* stroke_points,
-                             float* x_min, float* y_min, float* x_max, float* y_max) {
+                             float* x_min, float* y_min, float* x_max, float* y_max,
+                             bool collapse_line_axes) {
   float x_total = 0.0f;
   float y_total = 0.0f;
   if (kStrokeCenterProjectedStroke) {
@@ -652,8 +785,8 @@ void FinalizeProjectedStroke(const float proj_x[kStrokeTransmitMaxLength],
   const float extent_max = (max_abs_x > max_abs_y) ? max_abs_x : max_abs_y;
   const float extent_min = (max_abs_x > max_abs_y) ? max_abs_y : max_abs_x;
   const float extent_ratio = extent_min / extent_max;
-  const bool line_like =
-      kStrokeNormalizePcaAspect && (extent_ratio < kStrokeLineExtentRatio);
+  const bool line_like = collapse_line_axes && kStrokeNormalizePcaAspect &&
+                         (extent_ratio < kStrokeLineExtentRatio);
   last_stroke_motion_mode = line_like ? ((max_abs_x > max_abs_y) ? kStrokeMotionHorizontal
                                                                  : kStrokeMotionVertical)
                                     : kStrokeMotionDual;
@@ -699,6 +832,38 @@ void FinalizeProjectedStroke(const float proj_x[kStrokeTransmitMaxLength],
   }
 }
 
+void ProjectStrokeWithWandAxes(int start_index, int stroke_length, int transmit_length,
+                               const float stroke_gravity[3], int8_t* stroke_points,
+                               float* x_min, float* y_min, float* x_max, float* y_max) {
+  (void)stroke_gravity;
+
+  const float range = kWandTipLength * 2.0f;
+
+  float origin_orientation[3];
+  GetOrientationAt(start_index, 0, origin_orientation);
+  float origin_tip[3];
+  ComputeWandTipPosition(origin_orientation[0], origin_orientation[1],
+                         origin_orientation[2], origin_tip);
+
+  float proj_x[kStrokeTransmitMaxLength];
+  float proj_y[kStrokeTransmitMaxLength];
+  for (int j = 0; j < transmit_length; ++j) {
+    float orientation[3];
+    GetOrientationAt(start_index, j * kStrokeTransmitStride, orientation);
+    float tip[3];
+    ComputeWandTipPosition(orientation[0], orientation[1], orientation[2], tip);
+
+    const float delta[3] = {tip[0] - origin_tip[0], tip[1] - origin_tip[1],
+                            tip[2] - origin_tip[2]};
+    // Match Three.js XYZ: rot Y sweeps tip in Z (canvas X), rot Z in Y (canvas Y).
+    proj_x[j] = delta[2] / range;
+    proj_y[j] = delta[1] / range;
+  }
+
+  FinalizeProjectedStroke(proj_x, proj_y, transmit_length, stroke_points, x_min, y_min,
+                          x_max, y_max, kStrokeWandAxisCollapseLines);
+}
+
 void ProjectStrokeWithPca(int start_index, int stroke_length, int transmit_length,
                           float range, int8_t* stroke_points, float* x_min, float* y_min,
                           float* x_max, float* y_max) {
@@ -741,7 +906,7 @@ void ProjectStrokeWithPca(int start_index, int stroke_length, int transmit_lengt
   }
 
   FinalizeProjectedStroke(proj_x, proj_y, transmit_length, stroke_points, x_min, y_min,
-                          x_max, y_max);
+                          x_max, y_max, true);
 }
 
 void ProjectStrokeWithInPlanePca(int start_index, int stroke_length, int transmit_length,
@@ -793,7 +958,7 @@ void ProjectStrokeWithInPlanePca(int start_index, int stroke_length, int transmi
 
   SmoothProjectedStroke(proj_x, proj_y, transmit_length);
   FinalizeProjectedStroke(proj_x, proj_y, transmit_length, stroke_points, x_min, y_min,
-                          x_max, y_max);
+                          x_max, y_max, true);
 }
 
 void ProjectStrokeWithGravityPlane(int start_index, int stroke_length, int transmit_length,
@@ -847,7 +1012,7 @@ void ProjectStrokeWithGravityPlane(int start_index, int stroke_length, int trans
 
   SmoothProjectedStroke(proj_x, proj_y, transmit_length);
   FinalizeProjectedStroke(proj_x, proj_y, transmit_length, stroke_points, x_min, y_min,
-                          x_max, y_max);
+                          x_max, y_max, true);
 }
 
 bool StrokeUsesGravityPlane(const float gravity[3]) {
@@ -931,11 +1096,11 @@ StrokeMotionModeInternal ClassifyStrokeMotion(int start_index, int stroke_length
   constexpr float range = 90.0f;
 
   for (int j = 0; j < stroke_length; ++j) {
-    const int index = ((start_index + (j * 3)) % kGyroscopeDataLength);
-    const float* entry = &orientation_data[index];
-    const float nx = (entry[0] - ox) / range;
-    const float ny = (entry[1] - oy) / range;
-    const float nz = (entry[2] - oz) / range;
+    float orientation[3];
+    GetOrientationAt(start_index, j, orientation);
+    const float nx = (orientation[0] - ox) / range;
+    const float ny = (orientation[1] - oy) / range;
+    const float nz = (orientation[2] - oz) / range;
     variance[0] += nx * nx;
     variance[1] += ny * ny;
     variance[2] += nz * nz;
@@ -1005,25 +1170,22 @@ void UpdateStroke(int new_samples, bool* done_just_triggered) {
           (kGyroscopeDataLength - (3 * (stroke_length + current_head)))) %
          kGyroscopeDataLength);
 
-    const float* origin_entry = &orientation_data[start_index];
-    float ox = origin_entry[0];
-    float oy = origin_entry[1];
-    float oz = origin_entry[2];
+    float ox = 0.0f;
+    float oy = 0.0f;
+    float oz = 0.0f;
 
     if (!kStrokeUseStartOrigin) {
-      float x_total = 0.0f;
-      float y_total = 0.0f;
-      float z_total = 0.0f;
-      for (int j = 0; j < stroke_length; ++j) {
-        const int index = ((start_index + (j * 3)) % kGyroscopeDataLength);
-        const float* entry = &orientation_data[index];
-        x_total += entry[0];
-        y_total += entry[1];
-        z_total += entry[2];
-      }
-      ox = x_total / stroke_length;
-      oy = y_total / stroke_length;
-      oz = z_total / stroke_length;
+      float mean[3];
+      ComputeStrokeOrientationMean(start_index, stroke_length, mean);
+      ox = mean[0];
+      oy = mean[1];
+      oz = mean[2];
+    } else {
+      float origin[3];
+      GetOrientationAt(start_index, 0, origin);
+      ox = origin[0];
+      oy = origin[1];
+      oz = origin[2];
     }
 
     constexpr float range = 90.0f;
@@ -1042,10 +1204,11 @@ void UpdateStroke(int new_samples, bool* done_just_triggered) {
     int stroke_axis_x = kStrokeVerticalAxis;
     int stroke_axis_y = kStrokeHorizontalAxis;
     const bool tipped = IsStrokeTipped(stroke_gravity);
+    const bool use_wand_axes = kStrokeUseWandAxisProjection;
     const bool use_pca =
-        kStrokeUsePcaProjection && (!kStrokePcaFlatOnly || !tipped);
+        !use_wand_axes && kStrokeUsePcaProjection && (!kStrokePcaFlatOnly || !tipped);
     const bool use_gravity_plane =
-        !use_pca && (StrokeUsesGravityPlane(stroke_gravity) || tipped);
+        !use_wand_axes && !use_pca && (StrokeUsesGravityPlane(stroke_gravity) || tipped);
     last_stroke_tilt_compensated = tipped;
     last_stroke_use_gravity_plane = use_gravity_plane;
     last_stroke_in_plane_pca = use_gravity_plane && kStrokeTippedInPlanePca;
@@ -1053,7 +1216,8 @@ void UpdateStroke(int new_samples, bool* done_just_triggered) {
         use_gravity_plane && !kStrokeTippedInPlanePca &&
         (kStrokeTippedTrackGravityPerSample || kStrokeTrackGravityPerSample);
 
-    if (kStrokeUseWandPlane && kStrokeAdaptiveAxes && !use_gravity_plane) {
+    if (kStrokeUseWandPlane && kStrokeAdaptiveAxes && !use_gravity_plane &&
+        !use_wand_axes) {
       SelectDominantStrokeAxes(start_index, stroke_length, ox, oy, oz, &stroke_axis_x,
                                &stroke_axis_y);
       last_stroke_axis_x = stroke_axis_x;
@@ -1073,8 +1237,14 @@ void UpdateStroke(int new_samples, bool* done_just_triggered) {
     float x_max = 0.0f;
     float y_max = 0.0f;
 
+    const bool use_wand_axes_path = use_wand_axes;
     last_stroke_use_pca = use_pca;
-    if (use_pca) {
+    last_stroke_use_wand_axes = use_wand_axes_path;
+    if (use_wand_axes_path) {
+      ProjectStrokeWithWandAxes(start_index, stroke_length, *stroke_transmit_length,
+                                stroke_gravity, stroke_points, &x_min, &y_min, &x_max,
+                                &y_max);
+    } else if (use_pca) {
       ProjectStrokeWithPca(start_index, stroke_length, *stroke_transmit_length, range,
                            stroke_points, &x_min, &y_min, &x_max, &y_max);
     } else if (use_gravity_plane) {
@@ -1096,10 +1266,11 @@ void UpdateStroke(int new_samples, bool* done_just_triggered) {
         }
         prev_orientation_index = orientation_index;
 
-        const float* orientation_entry = &orientation_data[orientation_index];
-        const float nx = (orientation_entry[0] - ox) / range;
-        const float ny = (orientation_entry[1] - oy) / range;
-        const float nz = (orientation_entry[2] - oz) / range;
+        float orientation[3];
+        GetOrientationAt(start_index, j * kStrokeTransmitStride, orientation);
+        const float nx = (orientation[0] - ox) / range;
+        const float ny = (orientation[1] - oy) / range;
+        const float nz = (orientation[2] - oz) / range;
 
         const float* projection_gravity =
             (use_gravity_plane && kStrokeTrackGravityPerSample) ? g_at : stroke_gravity;
@@ -1142,6 +1313,44 @@ void UpdateStroke(int new_samples, bool* done_just_triggered) {
   }
 }
 
+void ResetAutoZeroQuickAccumulators() {
+  auto_zero_quick_count = 0;
+  auto_zero_quick_accel_sum[0] = 0.0f;
+  auto_zero_quick_accel_sum[1] = 0.0f;
+  auto_zero_quick_accel_sum[2] = 0.0f;
+  auto_zero_quick_gyro_sum[0] = 0.0f;
+  auto_zero_quick_gyro_sum[1] = 0.0f;
+  auto_zero_quick_gyro_sum[2] = 0.0f;
+}
+
+void ResetAutoZeroFullAccumulators() {
+  auto_zero_full_count = 0;
+  auto_zero_full_accel_mag_min = 999.0f;
+  auto_zero_full_accel_mag_max = 0.0f;
+  auto_zero_full_accel_sum[0] = 0.0f;
+  auto_zero_full_accel_sum[1] = 0.0f;
+  auto_zero_full_accel_sum[2] = 0.0f;
+  auto_zero_full_gyro_sum[0] = 0.0f;
+  auto_zero_full_gyro_sum[1] = 0.0f;
+  auto_zero_full_gyro_sum[2] = 0.0f;
+}
+
+void ResetAutoZeroAccumulators() {
+  ResetAutoZeroQuickAccumulators();
+  ResetAutoZeroFullAccumulators();
+}
+
+void FillAutoZeroAverages(int count, const float accel_sum[3], const float gyro_sum[3],
+                          float raw_accel_avg_out[3], float gyro_avg_out[3]) {
+  const float inv = 1.0f / static_cast<float>(count);
+  raw_accel_avg_out[0] = accel_sum[0] * inv;
+  raw_accel_avg_out[1] = accel_sum[1] * inv;
+  raw_accel_avg_out[2] = accel_sum[2] * inv;
+  gyro_avg_out[0] = gyro_sum[0] * inv;
+  gyro_avg_out[1] = gyro_sum[1] * inv;
+  gyro_avg_out[2] = gyro_sum[2] * inv;
+}
+
 }  // namespace
 
 void StrokePipelineInit(float sample_rate_hz) {
@@ -1151,6 +1360,11 @@ void StrokePipelineInit(float sample_rate_hz) {
   *stroke_transmit_length = 0;
   stroke_length = 0;
   stroke_gravity_snapshot_valid = false;
+  orientation_zero[0] = 0.0f;
+  orientation_zero[1] = 0.0f;
+  orientation_zero[2] = 0.0f;
+  auto_zero_cooldown = 0;
+  ResetAutoZeroAccumulators();
 }
 
 void StrokePipelineAddSample(const float accel_g[3], const float gyro_dps[3],
@@ -1187,8 +1401,145 @@ bool StrokePipelineGetLastTiltCompensated() { return last_stroke_tilt_compensate
 
 bool StrokePipelineGetLastUsePca() { return last_stroke_use_pca; }
 
+bool StrokePipelineGetLastUseWandAxes() { return last_stroke_use_wand_axes; }
+
 bool StrokePipelineGetLastInPlanePca() { return last_stroke_in_plane_pca; }
 
 bool StrokePipelineGetLastUseGravityPlane() { return last_stroke_use_gravity_plane; }
 
 bool StrokePipelineGetLastGravityTracked() { return last_stroke_gravity_tracked; }
+
+void StrokePipelineGetCurrentOrientation(float orientation_deg[3]) {
+  if (gyroscope_data_index < 3) {
+    orientation_deg[0] = 0.0f;
+    orientation_deg[1] = 0.0f;
+    orientation_deg[2] = 0.0f;
+    return;
+  }
+  const int start_index =
+      (gyroscope_data_index + kGyroscopeDataLength - 3) % kGyroscopeDataLength;
+  GetOrientationAt(start_index, 0, orientation_deg);
+}
+
+void StrokePipelineResetOrientationFromGravity(const float accel_g[3]) {
+  float tilt_deg[3] = {0.0f, 0.0f, 0.0f};
+  TiltFromGravity(accel_g, tilt_deg);
+  for (int i = 0; i < kGyroscopeDataLength; i += 3) {
+    orientation_data[i] = tilt_deg[0];
+    orientation_data[i + 1] = tilt_deg[1];
+    orientation_data[i + 2] = tilt_deg[2];
+  }
+}
+
+void StrokePipelineCaptureOrientationZero() {
+  if (gyroscope_data_index < 3) {
+    return;
+  }
+  const int start_index =
+      (gyroscope_data_index + kGyroscopeDataLength - 3) % kGyroscopeDataLength;
+  GetIntegratedOrientationAt(start_index, 0, orientation_zero);
+}
+
+void StrokePipelineApplyAutoOrientationCalibration(const float wand_accel_g[3],
+                                                   const float gyro_avg_dps[3]) {
+  StrokePipelineResetOrientationFromGravity(wand_accel_g);
+  StrokePipelineCaptureOrientationZero();
+  current_gyroscope_drift[0] = gyro_avg_dps[0];
+  current_gyroscope_drift[1] = gyro_avg_dps[1];
+  current_gyroscope_drift[2] = gyro_avg_dps[2];
+  current_velocity[0] = 0.0f;
+  current_velocity[1] = 0.0f;
+  current_velocity[2] = 0.0f;
+  current_position[0] = 0.0f;
+  current_position[1] = 0.0f;
+  current_position[2] = 0.0f;
+}
+
+OrientationAutoZeroKind StrokePipelineUpdateAutoOrientation(
+    const float raw_accel_sensor_g[3], const float gyro_wand_dps[3],
+    float raw_accel_avg_out[3], float gyro_avg_out[3]) {
+  if (!kOrientationAutoZero) {
+    return kOrientationAutoZeroNone;
+  }
+
+  if (auto_zero_cooldown > 0) {
+    auto_zero_cooldown -= 1;
+    return kOrientationAutoZeroNone;
+  }
+
+  if (*stroke_state == kStrokeDrawing) {
+    ResetAutoZeroAccumulators();
+    return kOrientationAutoZeroNone;
+  }
+
+  const float max_gyro = fmaxf(fabsf(gyro_wand_dps[0]),
+                               fmaxf(fabsf(gyro_wand_dps[1]), fabsf(gyro_wand_dps[2])));
+  const float motion = VectorMagnitude(current_velocity);
+  const bool quick_still = max_gyro <= kOrientationAutoZeroQuickGyroThresholdDps;
+  const bool full_still =
+      (max_gyro <= kOrientationAutoZeroFullGyroThresholdDps) && !IsMoving(0) &&
+      (motion <= 0.08f);
+
+  if (quick_still) {
+    auto_zero_quick_count += 1;
+    auto_zero_quick_accel_sum[0] += raw_accel_sensor_g[0];
+    auto_zero_quick_accel_sum[1] += raw_accel_sensor_g[1];
+    auto_zero_quick_accel_sum[2] += raw_accel_sensor_g[2];
+    auto_zero_quick_gyro_sum[0] += gyro_wand_dps[0];
+    auto_zero_quick_gyro_sum[1] += gyro_wand_dps[1];
+    auto_zero_quick_gyro_sum[2] += gyro_wand_dps[2];
+  } else if (auto_zero_quick_count > 0) {
+    auto_zero_quick_count -= kOrientationAutoZeroQuickDecaySamples;
+    if (auto_zero_quick_count <= 0) {
+      ResetAutoZeroQuickAccumulators();
+    }
+  }
+
+  if (full_still) {
+    const float accel_mag =
+        sqrtf((raw_accel_sensor_g[0] * raw_accel_sensor_g[0]) +
+              (raw_accel_sensor_g[1] * raw_accel_sensor_g[1]) +
+              (raw_accel_sensor_g[2] * raw_accel_sensor_g[2]));
+    if (accel_mag < auto_zero_full_accel_mag_min) {
+      auto_zero_full_accel_mag_min = accel_mag;
+    }
+    if (accel_mag > auto_zero_full_accel_mag_max) {
+      auto_zero_full_accel_mag_max = accel_mag;
+    }
+
+    auto_zero_full_count += 1;
+    auto_zero_full_accel_sum[0] += raw_accel_sensor_g[0];
+    auto_zero_full_accel_sum[1] += raw_accel_sensor_g[1];
+    auto_zero_full_accel_sum[2] += raw_accel_sensor_g[2];
+    auto_zero_full_gyro_sum[0] += gyro_wand_dps[0];
+    auto_zero_full_gyro_sum[1] += gyro_wand_dps[1];
+    auto_zero_full_gyro_sum[2] += gyro_wand_dps[2];
+  } else {
+    ResetAutoZeroFullAccumulators();
+  }
+
+  const float full_accel_spread =
+      auto_zero_full_accel_mag_max - auto_zero_full_accel_mag_min;
+  const bool likely_settled_on_surface =
+      full_still && (full_accel_spread < 0.06f) &&
+      (auto_zero_full_count >= kOrientationAutoZeroQuickSamples);
+  const bool suppress_quick = likely_settled_on_surface;
+
+  if (auto_zero_full_count >= kOrientationAutoZeroFullSamples) {
+    FillAutoZeroAverages(auto_zero_full_count, auto_zero_full_accel_sum,
+                         auto_zero_full_gyro_sum, raw_accel_avg_out, gyro_avg_out);
+    ResetAutoZeroAccumulators();
+    auto_zero_cooldown = kOrientationAutoZeroFullCooldownSamples;
+    return kOrientationAutoZeroFullSettle;
+  }
+
+  if (!suppress_quick && auto_zero_quick_count >= kOrientationAutoZeroQuickSamples) {
+    FillAutoZeroAverages(auto_zero_quick_count, auto_zero_quick_accel_sum,
+                         auto_zero_quick_gyro_sum, raw_accel_avg_out, gyro_avg_out);
+    ResetAutoZeroAccumulators();
+    auto_zero_cooldown = kOrientationAutoZeroQuickCooldownSamples;
+    return kOrientationAutoZeroQuickHold;
+  }
+
+  return kOrientationAutoZeroNone;
+}
