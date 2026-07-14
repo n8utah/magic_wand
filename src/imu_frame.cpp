@@ -142,5 +142,6 @@ void ImuFramePrintCalibration() {
   Serial.printf("  shaft axis (wand X) = sensor %c\n", 'X' + shaft_axis_index);
   Serial.printf("  gravity in wand frame: x=%+.3f y=%+.3f z=%+.3f (x should be ~0)\n",
                 wand_gravity[0], wand_gravity[1], wand_gravity[2]);
-  Serial.println("  Hold the board like a wand: long edge forward, then draw in the air.");
+  Serial.println("  Hold the board still for calibration (any comfortable grip).");
+  Serial.println("  Tipping the wand while drawing is supported.");
 }

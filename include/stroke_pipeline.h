@@ -27,4 +27,20 @@ int32_t StrokePipelineGetTransmitLength();
 const int8_t* StrokePipelineGetPoints();
 const uint8_t* StrokePipelineGetBuffer();
 
+enum StrokeMotionMode : int8_t {
+  kStrokeMotionDual = 0,
+  kStrokeMotionVertical = 1,
+  kStrokeMotionHorizontal = 2,
+};
+
+void StrokePipelineGetLastMotionMode(int8_t* motion_mode);
+
+// Debug: wand orientation axes used for the latest stroke (0=X, 1=Y, 2=Z).
+void StrokePipelineGetLastAxes(int* axis_x, int* axis_y);
+bool StrokePipelineGetLastTiltCompensated();
+bool StrokePipelineGetLastUsePca();
+bool StrokePipelineGetLastInPlanePca();
+bool StrokePipelineGetLastUseGravityPlane();
+bool StrokePipelineGetLastGravityTracked();
+
 #endif  // MAGIC_WAND_STROKE_PIPELINE_H_

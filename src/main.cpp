@@ -1,5 +1,5 @@
 // Magic Wand — ESP32 + MPU6050
-// Phase 3: BLE stroke service + web app compatibility
+// Phase 4: BLE + TFLite digit recognition
 
 #include <Arduino.h>
 #include <math.h>
@@ -10,6 +10,7 @@
 #include "imu_mpu6050.h"
 #include "rasterize_stroke.h"
 #include "stroke_pipeline.h"
+#include "tflite_runner.h"
 
 namespace {
 
@@ -20,7 +21,7 @@ constexpr int kRasterByteCount = kRasterWidth * kRasterHeight * kRasterChannels;
 
 int8_t raster_buffer[kRasterByteCount];
 
-void PrintStrokeRaster() {
+void PrintStrokeRasterAndClassify() {
   const int32_t point_count = StrokePipelineGetTransmitLength();
   if (point_count < 2) {
     Serial.println("(stroke too short to render)");
@@ -31,7 +32,32 @@ void PrintStrokeRaster() {
   RasterizeStroke(const_cast<int8_t*>(points), point_count, 0.6f, 0.6f, kRasterWidth,
                   kRasterHeight, raster_buffer);
 
-  Serial.printf("Gesture complete — %ld points\n", static_cast<long>(point_count));
+  Serial.printf("Gesture complete — %ld points", static_cast<long>(point_count));
+
+  int axis_x = 0;
+  int axis_y = 0;
+  if (StrokePipelineGetLastUsePca()) {
+    Serial.println(" (stroke mode: PCA 3-axis)");
+  } else if (StrokePipelineGetLastInPlanePca()) {
+    Serial.print(" (stroke mode: in-plane PCA");
+    if (StrokePipelineGetLastTiltCompensated()) {
+      Serial.print(", tipped");
+    }
+    Serial.println(")");
+  } else if (StrokePipelineGetLastUseGravityPlane()) {
+    Serial.print(" (stroke mode: gravity plane");
+    if (StrokePipelineGetLastGravityTracked()) {
+      Serial.print(", gravity-tracked");
+    }
+    if (StrokePipelineGetLastTiltCompensated()) {
+      Serial.print(", tipped");
+    }
+    Serial.println(")");
+  } else {
+    StrokePipelineGetLastAxes(&axis_x, &axis_y);
+    Serial.printf(" (stroke axes: %c+%c)\n", 'X' + axis_x, 'X' + axis_y);
+  }
+
   for (int y = 0; y < kRasterHeight; ++y) {
     for (int x = 0; x < kRasterWidth; ++x) {
       const int8_t* pixel =
@@ -43,6 +69,14 @@ void PrintStrokeRaster() {
     Serial.println();
   }
   Serial.println();
+
+  const char* label = "?";
+  int8_t score = 0;
+  if (TfliteRunnerClassify(raster_buffer, kRasterByteCount, &label, &score)) {
+    Serial.printf("Found %s (%d)\n\n", label, score);
+  } else {
+    Serial.println("Inference failed\n");
+  }
 }
 
 }  // namespace
@@ -52,7 +86,7 @@ void setup() {
   delay(500);
 
   Serial.println();
-  Serial.println("Magic Wand ESP32 — Phase 3 BLE + stroke pipeline");
+  Serial.println("Magic Wand ESP32 — Phase 4 TFLite inference");
 
   if (!ImuBegin()) {
     Serial.println("ERROR: MPU6050 init failed.");
@@ -72,6 +106,14 @@ void setup() {
 
   StrokePipelineInit(ImuGyroscopeSampleRate());
 
+  if (!TfliteRunnerBegin()) {
+    Serial.println("ERROR: TFLite model init failed.");
+    while (true) {
+      delay(1000);
+    }
+  }
+  Serial.println("TFLite model loaded (digits 0-9).");
+
   if (!BleStrokeServiceBegin()) {
     Serial.println("ERROR: BLE init failed.");
     while (true) {
@@ -80,9 +122,8 @@ void setup() {
   }
 
   Serial.println();
-  Serial.println("Open the web app in Chrome and connect via Bluetooth:");
-  Serial.println("  https://petewarden.github.io/magic_wand/website/index.html");
-  Serial.println("Draw gestures in the air, pause to finish each one.");
+  Serial.println("Web app: https://petewarden.github.io/magic_wand/website/index.html");
+  Serial.println("Draw digits 0-9 in the air, pause to finish each gesture.");
   Serial.println();
 }
 
@@ -107,6 +148,6 @@ void loop() {
   }
 
   if (done_just_triggered) {
-    PrintStrokeRaster();
+    PrintStrokeRasterAndClassify();
   }
 }
