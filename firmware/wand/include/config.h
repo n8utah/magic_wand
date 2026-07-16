@@ -121,4 +121,18 @@ constexpr bool kStrokeClassifyLineMotion = false;
 // Extent ratio (min/max) below this → treat as a line; above → equal-aspect (circles).
 constexpr float kStrokeLineExtentRatio = 0.12f;
 
+// D23 — WS2812 data (same wiring as spell target).
+constexpr int kWs2812DataPin = 23;
+constexpr int kWs2812LedCount = 1;
+constexpr uint8_t kWs2812Brightness = 64;
+
+constexpr unsigned long kWandLedEffectMs = 2000;
+constexpr unsigned long kWandLedFlashToggleMs = 120;
+
+// LED feedback and spell cast attempt threshold.
+constexpr int8_t kWandRecognitionMinScore = 50;
+
+// WS2812 color order: NEO_RGB if red/green look swapped vs firmware intent.
+constexpr bool kWs2812UseRgbOrder = true;
+
 #endif  // MAGIC_WAND_CONFIG_H_

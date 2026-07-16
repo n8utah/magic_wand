@@ -626,7 +626,7 @@ function formatBleError(err, step) {
     lines.push('Hint: remove old devices at chrome://bluetooth-internals');
     lines.push('Hint: remove spell-* from Windows Settings > Bluetooth');
     lines.push('Hint: click Reset BLE then reconnect');
-    lines.push('Hint: pick spell-xxxx (not BLESense) if both appear');
+    lines.push('Hint: pick spell-xxxx (not wand-xxxx) if both appear');
     lines.push('Hint: power-cycle the target and reflash target firmware');
   }
   if (err.name === 'StaleDeviceError') {
@@ -1159,7 +1159,7 @@ async function connectSpellTarget() {
   spellButton.style.backgroundColor = 'grey';
   updateSpellTargetConnected(false);
   spellTargetStatus('Requesting device ...');
-  spellTargetInfo('Turn off the BLESense wand. Pick spell-xxxx (not BLESense) in the chooser.');
+  spellTargetInfo('Turn off the wand. Pick spell-xxxx (not wand-xxxx) in the chooser.');
 
   try {
     const result = await requestAndConnectBle(SERVICE_UUID, 'spell-target', {

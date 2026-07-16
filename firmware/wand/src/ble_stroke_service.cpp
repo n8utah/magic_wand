@@ -31,12 +31,12 @@ class BleServerCallbacks : public NimBLEServerCallbacks {
 
 String MakeDeviceName() {
   const std::string address = NimBLEDevice::getAddress().toString();
-  String name = "BLESense-";
+  String name = "wand-";
   if (address.length() >= 5) {
-    name += static_cast<char>(toupper(address[address.length() - 5]));
-    name += static_cast<char>(toupper(address[address.length() - 4]));
-    name += static_cast<char>(toupper(address[address.length() - 2]));
-    name += static_cast<char>(toupper(address[address.length() - 1]));
+    name += static_cast<char>(tolower(address[address.length() - 5]));
+    name += static_cast<char>(tolower(address[address.length() - 4]));
+    name += static_cast<char>(tolower(address[address.length() - 2]));
+    name += static_cast<char>(tolower(address[address.length() - 1]));
   }
   return name;
 }
@@ -44,7 +44,7 @@ String MakeDeviceName() {
 }  // namespace
 
 bool BleStrokeServiceBegin() {
-  NimBLEDevice::init("BLESense");
+  NimBLEDevice::init("wand");
 
   NimBLEServer* server = NimBLEDevice::createServer();
   server->setCallbacks(new BleServerCallbacks());

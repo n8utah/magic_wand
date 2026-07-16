@@ -9,9 +9,9 @@
 #include "config.h"
 #include "imu_frame.h"
 #include "imu_mpu6050.h"
+#include "led_controller.h"
 #include "rasterize_stroke.h"
 #include "stroke_pipeline.h"
-#include "spell_ble_protocol.h"
 #include "tflite_runner.h"
 
 namespace {
@@ -76,15 +76,19 @@ void PrintStrokeRasterAndClassify() {
 
   const char* label = "?";
   int8_t score = 0;
-  if (TfliteRunnerClassify(raster_buffer, kRasterByteCount, &label, &score)) {
+  bool inference_ok =
+      TfliteRunnerClassify(raster_buffer, kRasterByteCount, &label, &score);
+  bool spell_activated = false;
+  if (inference_ok) {
     Serial.printf("Found %s (%d)\n", label, score);
-    if ((score >= kSpellActivationMinScore) && (label[0] != '\0')) {
-      BleSpellCasterTryActivate(label[0]);
+    if ((score >= kWandRecognitionMinScore) && (label[0] != '\0')) {
+      spell_activated = BleSpellCasterTryActivate(label[0]);
     }
     Serial.println();
   } else {
     Serial.println("Inference failed\n");
   }
+  LedControllerShowRecognitionResult(inference_ok, score, spell_activated);
 }
 
 }  // namespace
@@ -136,6 +140,8 @@ void setup() {
       delay(1000);
     }
   }
+
+  LedControllerBegin();
 
   Serial.println();
   Serial.println("Web app: https://petewarden.github.io/magic_wand/website/index.html");
@@ -192,4 +198,8 @@ void loop() {
   if (done_just_triggered) {
     PrintStrokeRasterAndClassify();
   }
+
+  const bool is_recording =
+      (StrokePipelineGetState() == static_cast<int32_t>(kStrokeDrawing));
+  LedControllerLoop(is_recording);
 }
