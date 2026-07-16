@@ -88,6 +88,9 @@ void PrintStrokeRasterAndClassify() {
   } else {
     Serial.println("Inference failed\n");
   }
+
+  BleSpellCasterLogCachedTargets();
+
   LedControllerShowRecognitionResult(inference_ok, score, spell_activated);
 }
 
@@ -141,6 +144,13 @@ void setup() {
     }
   }
 
+  if (!BleSpellCasterBegin()) {
+    Serial.println("ERROR: spell target scan init failed.");
+    while (true) {
+      delay(1000);
+    }
+  }
+
   LedControllerBegin();
 
   Serial.println();
@@ -151,6 +161,8 @@ void setup() {
 }
 
 void loop() {
+  BleSpellCasterLoop();
+
   if (!ImuSampleReady()) {
     return;
   }
