@@ -89,6 +89,75 @@
     font-size: x-large;
     cursor: pointer;
   }
+
+  .spell-targets {
+    width: 400px;
+    float: left;
+    margin-left: 6px;
+    height: auto;
+    min-height: 340px;
+  }
+
+  .spell-target-actions {
+    clear: both;
+    overflow: hidden;
+    margin-top: 28px;
+  }
+
+  .spell-target-actions .button {
+    float: none;
+    display: inline-block;
+    width: auto;
+    min-width: 88px;
+    margin: 6px 8px 0 0;
+  }
+
+  #spell_target_status {
+    clear: both;
+    margin-top: 10px;
+    font-size: 13px;
+    line-height: 1.4;
+    min-height: 36px;
+  }
+
+  #spell_target_list {
+    clear: both;
+    margin-top: 10px;
+  }
+
+  .spell-target-row {
+    background: #1a1a1a;
+    border: 1px solid #333;
+    padding: 8px;
+    margin-bottom: 6px;
+    font-size: 13px;
+  }
+
+  .spell-target-row input {
+    width: 36px;
+    font-size: 16px;
+    text-align: center;
+    margin-left: 8px;
+    margin-right: 8px;
+  }
+
+  .spell-target-row label {
+    font-size: 13px;
+  }
+
+  .spell-connected-controls {
+    display: none;
+    margin-top: 8px;
+  }
+
+  .spell-connected-controls.visible {
+    display: block;
+  }
+
+  .spell-target-actions button {
+    margin-right: 6px;
+    margin-top: 6px;
+  }
   </style>
 </head>
 <body>
@@ -125,6 +194,23 @@
     
     <div class="gesture_store">
     </div>
+
+    <div class="widget spell-targets">
+      <div class="label">Spell Target</div>
+      <button class="button" id="spellConnectButton">Bluetooth</button>
+      <button class="button" id="spellResetButton">Reset BLE</button>
+      <div id="spellConnectedControls" class="spell-connected-controls">
+        <button class="button" id="spellActivateButton">Activate</button>
+        <div class="spell-target-row">
+          <label for="spellCharacterInput">Activation character:</label>
+          <input type="text" id="spellCharacterInput" maxlength="1" />
+          <button class="button" id="spellSaveCharacterButton">Save</button>
+        </div>
+      </div>
+      <div id="spell_target_status">Click button to connect to a spell target</div>
+      <div id="spell_target_info" style="margin-top:10px;font-size:13px;"></div>
+      <pre id="spell_target_debug" style="margin-top:8px;font-size:11px;color:#8cf;max-height:180px;overflow:auto;white-space:pre-wrap;background:#0a0a0a;padding:8px;border:1px solid #333;"></pre>
+    </div>
   </div>
 </body>
 <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
@@ -154,23 +240,18 @@ function msg(m){
 }
 
 async function connect() {
-  bigButton.style.backgroundColor="grey";
+  bigButton.style.backgroundColor = 'grey';
   msg('Requesting device ...');
 
-  const device = await navigator.bluetooth.requestDevice({
-    filters: [
-      {
-        services: [SERVICE_UUID] // SERVICE_UUID
-      }
-    ]
-  });
+  try {
+    const result = await requestAndConnectBle(SERVICE_UUID, 'wand');
+    const device = result.device;
+    const service = result.service;
 
-  msg('Connecting to device ...');
-  device.addEventListener('gattserverdisconnected', onDisconnected);
-  const server = await device.gatt.connect();
+    msg('Connecting to device ...');
+    device.addEventListener('gattserverdisconnected', onDisconnected);
 
-  msg('Getting primary service ...');
-  const service = await server.getPrimaryService(SERVICE_UUID);
+    msg('Getting primary service ...');
 
   // Set up the characteristics
   var orientationAvailable = false;
@@ -209,6 +290,9 @@ async function connect() {
     msg('Connected — stroke + live orientation.');
   } else {
     msg('Connected — upload latest ESP32 firmware for 3D orientation.');
+  }
+  } catch (err) {
+    handleBleUserError(err, msg, function() { bigButton.style.backgroundColor = 'red'; }, null);
   }
 }
   
@@ -266,9 +350,12 @@ async function connect() {
     }
   }
 
-  function onDisconnected(event) {
-    let device = event.target;
-    bigButton.style.backgroundColor="red";
+function onDisconnected(event) {
+  let device = event.target;
+  bigButton.style.backgroundColor = 'red';
+  if (activeBleDevice && activeBleDevice.id === device.id) {
+    activeBleDevice = null;
+  }
     resetOrientationZero();
     // clear read polling
     for (const sensor of sensors) {
@@ -480,6 +567,661 @@ var BLEsense =
 };
 const sensors = Object.keys(BLEsense);
 const SERVICE_UUID = '4798e0f2-0000-4d68-af64-8a8f5258404e';
+const STROKE_CHARACTERISTIC_UUID = '4798e0f2-300a-4d68-af64-8a8f5258404e';
+const SPELL_CHARACTER_UUID = '4798e0f2-4001-4d68-af64-8a8f5258404e';
+const SPELL_ACTIVATE_UUID = '4798e0f2-4002-4d68-af64-8a8f5258404e';
+const SPELL_ACTIVATE_COMMAND = 0x01;
+
+var activeBleDevice = null;
+var spellBleDevice = null;
+var spellCharacterCharacteristic = null;
+var spellActivateCharacteristic = null;
+var bleDebugLines = [];
+
+function bleDebug(step, detail) {
+  const ts = new Date().toLocaleTimeString();
+  const line = ts + ' [' + step + '] ' + detail;
+  bleDebugLines.push(line);
+  if (bleDebugLines.length > 50) {
+    bleDebugLines.shift();
+  }
+  console.log('BLE DEBUG', step, detail);
+  const el = document.getElementById('spell_target_debug');
+  if (el) {
+    el.textContent = bleDebugLines.join('\n');
+    el.scrollTop = el.scrollHeight;
+  }
+}
+
+function bleDebugClear() {
+  bleDebugLines = [];
+  const el = document.getElementById('spell_target_debug');
+  if (el) {
+    el.textContent = '';
+  }
+}
+
+function describeBleDevice(device) {
+  if (!device) {
+    return 'device=null';
+  }
+  return 'name=' + (device.name || 'null') +
+      ' id=' + device.id +
+      ' gatt.connected=' + (device.gatt ? device.gatt.connected : 'no-gatt');
+}
+
+function formatBleError(err, step) {
+  const lines = [
+    'Step: ' + (step || err.bleStep || 'unknown'),
+    'Error: ' + (err.name || 'Error'),
+    'Message: ' + (err.message || String(err)),
+  ];
+  if (err.code !== undefined) {
+    lines.push('Code: ' + err.code);
+  }
+  if (err.name === 'NetworkError') {
+    lines.push('Hint: Windows probes BLE during the picker — wait and retry');
+    lines.push('Hint: click Reset BLE, connect once, then click Bluetooth again (skips picker)');
+    lines.push('Hint: disconnect the wand first');
+    lines.push('Hint: remove old devices at chrome://bluetooth-internals');
+    lines.push('Hint: remove spell-* from Windows Settings > Bluetooth');
+    lines.push('Hint: click Reset BLE then reconnect');
+    lines.push('Hint: pick spell-xxxx (not BLESense) if both appear');
+    lines.push('Hint: power-cycle the target and reflash target firmware');
+  }
+  if (err.name === 'StaleDeviceError') {
+    lines.push('Hint: click Reset BLE, then try Bluetooth again');
+  }
+  if (err.name === 'NotFoundError') {
+    lines.push('Hint: device picker was cancelled or no matching device found');
+  }
+  if (err.name === 'SecurityError') {
+    lines.push('Hint: use https:// or http://localhost (not file://)');
+  }
+  return lines.join('\n');
+}
+
+async function disconnectActiveBleDevice() {
+  if (activeBleDevice && activeBleDevice.gatt && activeBleDevice.gatt.connected) {
+    bleDebug('disconnect', 'closing ' + describeBleDevice(activeBleDevice));
+    activeBleDevice.gatt.disconnect();
+    await new Promise(function(resolve) { setTimeout(resolve, 500); });
+  } else {
+    bleDebug('disconnect', 'no active connection to close');
+  }
+  activeBleDevice = null;
+}
+
+async function bleSleep(ms) {
+  return new Promise(function(resolve) { setTimeout(resolve, ms); });
+}
+
+async function forgetCachedBleDevices(options) {
+  if (!navigator.bluetooth.getDevices) {
+    bleDebug('cache', 'getDevices not supported');
+    return 0;
+  }
+  const devices = await navigator.bluetooth.getDevices();
+  bleDebug('cache', 'getDevices count=' + devices.length);
+  let forgotten = 0;
+  for (const device of devices) {
+    bleDebug('cache', describeBleDevice(device));
+    const isSpell = device.name && device.name.indexOf('spell-') === 0;
+    const isStale = !device.name;
+    const shouldForget = options.all || isSpell || (options.stale && isStale);
+    if (!shouldForget || !device.forget) {
+      continue;
+    }
+    try {
+      bleDebug('forget', describeBleDevice(device));
+      await device.forget();
+      forgotten++;
+    } catch (forgetErr) {
+      bleDebug('forget-fail', forgetErr.message);
+    }
+  }
+  bleDebug('forget', 'removed ' + forgotten + ' cached device(s)');
+  return forgotten;
+}
+
+async function resetSpellBleCache() {
+  bleDebugClear();
+  bleDebug('reset', 'forgetting all cached Web Bluetooth devices');
+  await disconnectActiveBleDevice();
+  spellBleDevice = null;
+  spellCharacterCharacteristic = null;
+  spellActivateCharacteristic = null;
+  updateSpellTargetConnected(false);
+  document.getElementById('spellConnectButton').style.backgroundColor = 'red';
+  const count = await forgetCachedBleDevices({ all: true });
+  spellTargetStatus('BLE cache cleared (' + count + ' device(s)). Try Bluetooth again.');
+  spellTargetInfo('Also remove spell-* from Windows Settings > Bluetooth if connect still fails.');
+}
+
+async function prepareBleDevice(device) {
+  if (!device || !device.gatt) {
+    return;
+  }
+  try {
+    if (device.gatt.connected) {
+      bleDebug('prep', 'disconnect lingering gatt session');
+      device.gatt.disconnect();
+      await bleSleep(1500);
+    }
+  } catch (err) {
+    bleDebug('prep', 'disconnect skipped: ' + err.message);
+  }
+}
+
+async function waitForDeviceAdvertisement(device, timeoutMs) {
+  if (!device.watchAdvertisements) {
+    bleDebug('watchAdv', 'not supported — skipping');
+    return;
+  }
+  bleDebug('watchAdv', 'waiting for live advertisement');
+  await new Promise(function(resolve) {
+    let finished = false;
+    function finish(reason) {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      device.removeEventListener('advertisementreceived', onAdv);
+      clearTimeout(timer);
+      bleDebug('watchAdv', reason);
+      resolve();
+    }
+    function onAdv() {
+      finish('advertisement seen');
+    }
+    const timer = setTimeout(function() {
+      finish('timeout — continuing');
+    }, timeoutMs || 8000);
+    device.addEventListener('advertisementreceived', onAdv);
+    device.watchAdvertisements().catch(function(err) {
+      finish('watch failed: ' + err.message);
+    });
+  });
+}
+
+async function discoverSpellService(server, serviceUuid) {
+  bleDebug('getPrimaryServices', 'discovering all services');
+  const services = await server.getPrimaryServices();
+  bleDebug('getPrimaryServices', 'count=' + services.length +
+      ' uuids=' + services.map(function(s) { return s.uuid; }).join(', '));
+  const service = services.find(function(s) {
+    return s.uuid === serviceUuid ||
+        s.uuid.replace(/-/g, '').toLowerCase() ===
+        serviceUuid.replace(/-/g, '').toLowerCase();
+  });
+  if (service) {
+    bleDebug('getPrimaryService', 'ok uuid=' + service.uuid);
+    return service;
+  }
+  bleDebug('getPrimaryService', 'fallback to direct lookup');
+  return server.getPrimaryService(serviceUuid);
+}
+
+async function connectAndGetService(device, serviceUuid, options) {
+  const postDelay = options.postPickerDelayMs || 0;
+  const settleDelay = options.advertisingSettleMs || 0;
+  const maxAttempts = options.maxAttempts || 1;
+  const retryDelay = options.retryDelayMs || 800;
+
+  if (postDelay > 0) {
+    bleDebug('post-picker-wait', postDelay + 'ms for Windows probe disconnect');
+    await bleSleep(postDelay);
+  }
+  if (settleDelay > 0) {
+    bleDebug('advertising-settle-wait', settleDelay + 'ms for target to re-advertise');
+    await bleSleep(settleDelay);
+  }
+
+  await prepareBleDevice(device);
+
+  let lastError = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (attempt > 0) {
+      const waitMs = retryDelay + (attempt * 400);
+      bleDebug('retry-wait', 'attempt ' + (attempt + 1) + ' waiting ' + waitMs + 'ms');
+      await bleSleep(waitMs);
+    }
+    try {
+      if (device.gatt.connected) {
+        bleDebug('gatt.disconnect', 'clearing stale connection before retry');
+        device.gatt.disconnect();
+        await bleSleep(400);
+      }
+
+      bleDebug('gatt.connect', 'attempt ' + (attempt + 1) + ' ' + describeBleDevice(device));
+      let droppedDuringConnect = false;
+      function onEarlyDisconnect() {
+        droppedDuringConnect = true;
+        bleDebug('gatt.disconnect', 'event during connect attempt ' + (attempt + 1));
+      }
+      device.addEventListener('gattserverdisconnected', onEarlyDisconnect);
+      let server;
+      try {
+        server = await device.gatt.connect();
+      } finally {
+        device.removeEventListener('gattserverdisconnected', onEarlyDisconnect);
+      }
+      bleDebug('gatt.connect', 'ok connected=' + device.gatt.connected +
+          (droppedDuringConnect ? ' (disconnect event fired)' : ''));
+
+      await bleSleep(150);
+
+      if (!device.gatt.connected) {
+        throw new Error('GATT disconnected before service discovery');
+      }
+
+      const service = await discoverSpellService(server, serviceUuid);
+
+      if (!device.gatt.connected) {
+        throw new Error('GATT disconnected after service discovery');
+      }
+      return { server: server, service: service };
+    } catch (err) {
+      lastError = err;
+      if (err.message && err.message.indexOf('GATT Server is disconnected') >= 0) {
+        err.bleStep = 'getPrimaryService';
+      } else if (err.message && err.message.indexOf('before service discovery') >= 0) {
+        err.bleStep = 'getPrimaryService';
+      } else if (!err.bleStep) {
+        err.bleStep = 'gatt.connect';
+      }
+      bleDebug('connect-service-fail', 'attempt ' + (attempt + 1) + ' ' + err.name + ': ' + err.message);
+      if (device.gatt.connected) {
+        device.gatt.disconnect();
+      }
+      await bleSleep(800);
+    }
+  }
+  lastError.bleStep = lastError.bleStep || 'getPrimaryService';
+  lastError.bleDevice = describeBleDevice(device);
+  if (device.forget && options.forgetOnFailure !== false) {
+    try {
+      bleDebug('forget', 'clearing stale device after failed connect');
+      await device.forget();
+    } catch (forgetErr) {
+      bleDebug('forget-fail', forgetErr.message);
+    }
+  }
+  throw lastError;
+}
+
+async function requestAndConnectBle(serviceUuid, label, connectOptions) {
+  connectOptions = connectOptions || {};
+  if (connectOptions.clearDebugLog !== false) {
+    bleDebugClear();
+  }
+  bleDebug('env', 'label=' + label +
+      ' secureContext=' + window.isSecureContext +
+      ' href=' + location.href);
+  bleDebug('env', 'userAgent=' + navigator.userAgent);
+  bleDebug('start', 'serviceUuid=' + serviceUuid);
+
+  await disconnectActiveBleDevice();
+
+  const requestOptions = connectOptions.requestDeviceOptions || {
+    filters: [{ services: [serviceUuid] }],
+  };
+
+  let device = null;
+  let usedPicker = false;
+  const namePrefix = connectOptions.preferCachedNamePrefix;
+  if (namePrefix && navigator.bluetooth.getDevices) {
+    const devices = await navigator.bluetooth.getDevices();
+    bleDebug('cache', 'getDevices count=' + devices.length);
+    device = devices.find(function(d) {
+      return d.name && d.name.indexOf(namePrefix) === 0;
+    }) || null;
+    if (device) {
+      bleDebug('requestDevice', 'skip picker, reuse ' + describeBleDevice(device));
+    }
+  }
+
+  try {
+    if (!device) {
+      bleDebug('requestDevice', 'opening picker filters=' + JSON.stringify(requestOptions.filters));
+      device = await navigator.bluetooth.requestDevice(requestOptions);
+      usedPicker = true;
+      bleDebug('requestDevice', 'ok ' + describeBleDevice(device));
+      await waitForDeviceAdvertisement(device, 8000);
+      await prepareBleDevice(device);
+    }
+  } catch (err) {
+    err.bleStep = 'requestDevice';
+    throw err;
+  }
+
+  let result;
+  try {
+    result = await connectAndGetService(device, serviceUuid, {
+      postPickerDelayMs: usedPicker ? (connectOptions.postPickerDelayMs || 0) : 0,
+      advertisingSettleMs: usedPicker ? 0 : (connectOptions.advertisingSettleMs || 0),
+      maxAttempts: connectOptions.maxAttempts || 1,
+      retryDelayMs: connectOptions.retryDelayMs || 800,
+      forgetOnFailure: false,
+    });
+  } catch (err) {
+    if (device && device.forget) {
+      bleDebug('retry', 'first connect pass failed — forget and open picker again');
+      try {
+        await device.forget();
+      } catch (forgetErr) {
+        bleDebug('forget-fail', forgetErr.message);
+      }
+      try {
+        bleDebug('requestDevice', 'opening picker (second pass)');
+        device = await navigator.bluetooth.requestDevice(requestOptions);
+        usedPicker = true;
+        bleDebug('requestDevice', 'ok ' + describeBleDevice(device));
+        await waitForDeviceAdvertisement(device, 8000);
+        await prepareBleDevice(device);
+        result = await connectAndGetService(device, serviceUuid, {
+          postPickerDelayMs: connectOptions.postPickerDelayMs || 0,
+          advertisingSettleMs: 0,
+          maxAttempts: connectOptions.maxAttempts || 1,
+          retryDelayMs: connectOptions.retryDelayMs || 800,
+          forgetOnFailure: false,
+        });
+      } catch (retryErr) {
+        if (!retryErr.bleStep) {
+          retryErr.bleStep = 'requestDevice';
+        }
+        throw retryErr;
+      }
+    } else if (!usedPicker && device && device.forget) {
+      bleDebug('cache-fallback', 'cached reconnect failed — forgetting and opening picker');
+      try {
+        await device.forget();
+      } catch (forgetErr) {
+        bleDebug('forget-fail', forgetErr.message);
+      }
+      try {
+        bleDebug('requestDevice', 'opening picker after cache miss');
+        device = await navigator.bluetooth.requestDevice(requestOptions);
+        usedPicker = true;
+        bleDebug('requestDevice', 'ok ' + describeBleDevice(device));
+        result = await connectAndGetService(device, serviceUuid, {
+          postPickerDelayMs: connectOptions.postPickerDelayMs || 0,
+          advertisingSettleMs: 0,
+          maxAttempts: connectOptions.maxAttempts || 1,
+          retryDelayMs: connectOptions.retryDelayMs || 800,
+        });
+      } catch (fallbackErr) {
+        if (!fallbackErr.bleStep) {
+          fallbackErr.bleStep = 'requestDevice';
+        }
+        throw fallbackErr;
+      }
+    } else {
+      throw err;
+    }
+  }
+
+  activeBleDevice = device;
+  return { device: device, server: result.server, service: result.service };
+}
+
+function handleBleUserError(err, setStatus, setButtonRed, setDetail) {
+  const step = err.bleStep || 'unknown';
+  const detail = formatBleError(err, step);
+  if (err.bleDevice) {
+    bleDebug('context', err.bleDevice);
+  }
+  bleDebug('FAILED', detail.replace(/\n/g, ' | '));
+  console.error('BLE failed at', step, err);
+  if (err.name === 'NotFoundError') {
+    setStatus('Cancelled — pick spell-xxxx in the device chooser.');
+    if (setDetail) {
+      setDetail(detail);
+    }
+    return;
+  }
+  if (setButtonRed) {
+    setButtonRed();
+  }
+  setStatus('Failed at ' + step + ': ' + err.name);
+  if (setDetail) {
+    setDetail(detail);
+  }
+}
+
+function spellTargetStatus(text) {
+  const el = document.getElementById('spell_target_status');
+  if (el) {
+    el.innerText = text;
+  }
+}
+
+function spellTargetInfo(text) {
+  const el = document.getElementById('spell_target_info');
+  if (el) {
+    el.innerText = text;
+  }
+}
+
+function onSpellDisconnected(event) {
+  const device = event.target;
+  document.getElementById('spellConnectButton').style.backgroundColor = 'red';
+  spellCharacterCharacteristic = null;
+  spellActivateCharacteristic = null;
+  updateSpellTargetConnected(false);
+  if (activeBleDevice && activeBleDevice.id === device.id) {
+    activeBleDevice = null;
+  }
+  bleDebug('disconnected', describeBleDevice(device));
+  spellTargetStatus('Device ' + (device.name || 'spell target') + ' is disconnected.');
+}
+
+function updateSpellTargetConnected(connected, character) {
+  const controls = document.getElementById('spellConnectedControls');
+  const input = document.getElementById('spellCharacterInput');
+  if (connected) {
+    controls.classList.add('visible');
+    input.value = character || '';
+  } else {
+    controls.classList.remove('visible');
+    input.value = '';
+  }
+}
+
+async function readSpellCharacter(characteristic) {
+  bleDebug('readValue', 'spell character');
+  const value = await characteristic.readValue();
+  const character = String.fromCharCode(value.getUint8(0));
+  bleDebug('readValue', 'ok character=' + character);
+  return character;
+}
+
+async function writeSpellCharacter(characteristic, character) {
+  const command = new Uint8Array([character.charCodeAt(0)]);
+  const props = characteristic.properties;
+  bleDebug('character-props',
+      'write=' + props.write + ' writeWithoutResponse=' + props.writeWithoutResponse);
+  if (props.writeWithoutResponse) {
+    bleDebug('writeValue', 'character ' + character + ' (without response)');
+    await characteristic.writeValueWithoutResponse(command);
+    return;
+  }
+  if (props.write) {
+    bleDebug('writeValue', 'character ' + character + ' (with response)');
+    await characteristic.writeValue(command);
+    return;
+  }
+  throw new Error('Character characteristic is not writable');
+}
+
+async function saveSpellCharacter() {
+  const saveButton = document.getElementById('spellSaveCharacterButton');
+  const input = document.getElementById('spellCharacterInput');
+  const character = input.value.trim();
+
+  if (!spellBleDevice || !spellBleDevice.gatt || !spellBleDevice.gatt.connected) {
+    spellTargetStatus('Connect to a spell target first.');
+    return;
+  }
+  if (character.length !== 1) {
+    spellTargetStatus('Enter exactly one character.');
+    return;
+  }
+  const code = character.charCodeAt(0);
+  if (code < 32 || code > 126) {
+    spellTargetStatus('Use a printable character (letters, digits, symbols).');
+    return;
+  }
+
+  saveButton.disabled = true;
+  spellTargetStatus('Saving character...');
+
+  try {
+    let characteristic = spellCharacterCharacteristic;
+    if (!characteristic) {
+      const service = await spellBleDevice.gatt.getPrimaryService(SERVICE_UUID);
+      characteristic = await service.getCharacteristic(SPELL_CHARACTER_UUID);
+      spellCharacterCharacteristic = characteristic;
+    }
+    await writeSpellCharacter(characteristic, character);
+    const saved = await readSpellCharacter(characteristic);
+    updateSpellTargetConnected(true, saved);
+    spellTargetStatus('Saved activation character: ' + saved);
+    spellTargetInfo('Wand must match this character to activate this target.');
+  } catch (err) {
+    err.bleStep = 'writeValue';
+    handleBleUserError(err, spellTargetStatus, null, spellTargetInfo);
+  } finally {
+    saveButton.disabled = !(
+        spellBleDevice && spellBleDevice.gatt && spellBleDevice.gatt.connected);
+  }
+}
+
+async function writeSpellActivateCommand(characteristic) {
+  const command = new Uint8Array([SPELL_ACTIVATE_COMMAND]);
+  const props = characteristic.properties;
+  bleDebug('activate-props',
+      'write=' + props.write + ' writeWithoutResponse=' + props.writeWithoutResponse);
+
+  if (props.writeWithoutResponse) {
+    bleDebug('writeValue', 'activate 0x01 (without response)');
+    await characteristic.writeValueWithoutResponse(command);
+    return;
+  }
+  if (props.write) {
+    bleDebug('writeValue', 'activate 0x01 (with response)');
+    await characteristic.writeValue(command);
+    return;
+  }
+  throw new Error('Activate characteristic is not writable');
+}
+
+async function activateSpellTarget() {
+  const activateButton = document.getElementById('spellActivateButton');
+  bleDebug('activate', 'button clicked');
+
+  if (!spellBleDevice || !spellBleDevice.gatt) {
+    spellTargetStatus('Connect to a spell target first.');
+    return;
+  }
+  if (!spellBleDevice.gatt.connected) {
+    spellTargetStatus('Not connected — click Bluetooth again.');
+    spellActivateCharacteristic = null;
+    updateSpellTargetConnected(false);
+    return;
+  }
+
+  activateButton.disabled = true;
+  spellTargetStatus('Sending activate...');
+
+  try {
+    let activateChar = spellActivateCharacteristic;
+    if (!activateChar) {
+      bleDebug('getPrimaryService', 'fetch activate characteristic');
+      const service = await spellBleDevice.gatt.getPrimaryService(SERVICE_UUID);
+      activateChar = await service.getCharacteristic(SPELL_ACTIVATE_UUID);
+      spellActivateCharacteristic = activateChar;
+    }
+    await writeSpellActivateCommand(activateChar);
+    bleDebug('writeValue', 'activate ok');
+    spellTargetStatus('Activated — target should blink and disconnect.');
+    spellTargetInfo('LED flashes for 3s, then target re-advertises.');
+  } catch (err) {
+    err.bleStep = 'writeValue';
+    handleBleUserError(err, spellTargetStatus, null, spellTargetInfo);
+  } finally {
+    activateButton.disabled = false;
+  }
+}
+
+async function connectSpellTarget() {
+  const spellButton = document.getElementById('spellConnectButton');
+  spellButton.style.backgroundColor = 'grey';
+  updateSpellTargetConnected(false);
+  spellTargetStatus('Requesting device ...');
+  spellTargetInfo('Turn off the BLESense wand. Pick spell-xxxx (not BLESense) in the chooser.');
+
+  try {
+    const result = await requestAndConnectBle(SERVICE_UUID, 'spell-target', {
+      clearDebugLog: false,
+      preferCachedNamePrefix: 'spell-',
+      requestDeviceOptions: {
+        filters: [{ services: [SERVICE_UUID] }],
+        optionalServices: [SERVICE_UUID, SPELL_CHARACTER_UUID, SPELL_ACTIVATE_UUID],
+      },
+      postPickerDelayMs: 3000,
+      advertisingSettleMs: 1500,
+      maxAttempts: 4,
+      retryDelayMs: 1000,
+    });
+    const device = result.device;
+    const service = result.service;
+
+    spellTargetStatus('Connected — reading spell characteristic ...');
+    device.addEventListener('gattserverdisconnected', onSpellDisconnected);
+    spellBleDevice = device;
+
+    let characteristic;
+    try {
+      bleDebug('getCharacteristic', SPELL_CHARACTER_UUID);
+      characteristic = await service.getCharacteristic(SPELL_CHARACTER_UUID);
+      bleDebug('getCharacteristic', 'ok');
+    } catch (err) {
+      err.bleStep = 'getCharacteristic';
+      throw err;
+    }
+    spellCharacterCharacteristic = characteristic;
+
+    try {
+      bleDebug('getCharacteristic', SPELL_ACTIVATE_UUID);
+      spellActivateCharacteristic = await service.getCharacteristic(SPELL_ACTIVATE_UUID);
+      bleDebug('getCharacteristic', 'activate ok');
+    } catch (err) {
+      err.bleStep = 'getCharacteristic';
+      throw err;
+    }
+
+    let character;
+    try {
+      character = await readSpellCharacter(characteristic);
+    } catch (err) {
+      err.bleStep = 'readValue';
+      throw err;
+    }
+
+    spellButton.style.backgroundColor = 'green';
+    updateSpellTargetConnected(true, character);
+    spellTargetStatus('Connected to ' + (device.name || 'spell target'));
+    spellTargetInfo('Activation character: ' + character);
+    bleDebug('done', 'success');
+  } catch (err) {
+    updateSpellTargetConnected(false);
+    handleBleUserError(err, spellTargetStatus, function() {
+      spellButton.style.backgroundColor = 'red';
+    }, spellTargetInfo);
+  }
+}
+
 var bytesReceived = 0;
 var bytesPrevious = 0;
 
@@ -697,7 +1439,17 @@ Array.prototype.latest = function(){return this[this.length - 1];};
   
   initStrokeGraph();
   initOrientation3D();
-    
+
+  if ('bluetooth' in navigator) {
+    document.getElementById('spellConnectButton').addEventListener('click', connectSpellTarget);
+    document.getElementById('spellActivateButton').addEventListener('click', activateSpellTarget);
+    document.getElementById('spellSaveCharacterButton').addEventListener('click', saveSpellCharacter);
+    document.getElementById('spellResetButton').addEventListener('click', resetSpellBleCache);
+  } else {
+    document.getElementById('spellConnectButton').style.backgroundColor = 'red';
+    spellTargetStatus('Web Bluetooth not supported');
+  }
+
   requestAnimationFrame(draw);
   </script>
   </html>

@@ -5,11 +5,13 @@
 #include <math.h>
 
 #include "ble_stroke_service.h"
+#include "ble_spell_caster.h"
 #include "config.h"
 #include "imu_frame.h"
 #include "imu_mpu6050.h"
 #include "rasterize_stroke.h"
 #include "stroke_pipeline.h"
+#include "spell_ble_protocol.h"
 #include "tflite_runner.h"
 
 namespace {
@@ -75,7 +77,11 @@ void PrintStrokeRasterAndClassify() {
   const char* label = "?";
   int8_t score = 0;
   if (TfliteRunnerClassify(raster_buffer, kRasterByteCount, &label, &score)) {
-    Serial.printf("Found %s (%d)\n\n", label, score);
+    Serial.printf("Found %s (%d)\n", label, score);
+    if ((score >= kSpellActivationMinScore) && (label[0] != '\0')) {
+      BleSpellCasterTryActivate(label[0]);
+    }
+    Serial.println();
   } else {
     Serial.println("Inference failed\n");
   }
